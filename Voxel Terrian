@@ -157,8 +157,21 @@ end
 
 
 local floor = math.floor
-local readu8 = buffer.readu8
-local writeu8 = buffer.writeu8
+
+-- Byte buffers keep the voxel store compact; executors without the buffer library get a plain-table stand-in
+local bufferLib = (type(buffer) == "table" and buffer.create and buffer.readu8 and buffer.writeu8) and buffer or {
+	create = function(size)
+		return table.create(size, 0)
+	end,
+	readu8 = function(b, i)
+		return b[i + 1]
+	end,
+	writeu8 = function(b, i, v)
+		b[i + 1] = v
+	end
+}
+local readu8 = bufferLib.readu8
+local writeu8 = bufferLib.writeu8
 
 local VS = CONFIG.VOXEL_SIZE
 local CV = CONFIG.CHUNK_VOXELS
@@ -254,7 +267,7 @@ local function storeSet(gx, gy, gz, id, occ)
 		if id == 0 then
 			return
 		end
-		store = buffer.create(CHUNK_CELLS * 2)
+		store = bufferLib.create(CHUNK_CELLS * 2)
 		CHUNK_STORE[key] = store
 	end
 	local li = (gx - cx * CV) + (gy - cy * CV) * CV + (gz - cz * CV) * CV2
@@ -277,11 +290,14 @@ local function gridRegion(gx0, gy0, gz0, sx, sy, sz)
 	return Region3.new(
 		Vector3.new(gx0 * VS, gy0 * VS, gz0 * VS),
 		Vector3.new((gx0 + sx) * VS, (gy0 + sy) * VS, (gz0 + sz) * VS)
-	)
+	):ExpandToGrid(VS)
 end
 
 local function readVoxels(gx0, gy0, gz0, sx, sy, sz)
-	local ok, mats, occs = pcall(Terrain.ReadVoxels, Terrain, gridRegion(gx0, gy0, gz0, sx, sy, sz), VS)
+	local region = gridRegion(gx0, gy0, gz0, sx, sy, sz)
+	local ok, mats, occs = pcall(function()
+		return Terrain:ReadVoxels(region, VS)
+	end)
 	if not ok or not mats then
 		return nil
 	end
@@ -297,7 +313,9 @@ end
 local function clearLand(gx0, gy0, gz0, sx, sy, sz, hasWater, mats, occs, ox, oy, oz)
 	local region = gridRegion(gx0, gy0, gz0, sx, sy, sz)
 	if not hasWater then
-		pcall(Terrain.FillRegion, Terrain, region, VS, MAT_AIR)
+		pcall(function()
+			Terrain:FillRegion(region, VS, MAT_AIR)
+		end)
 		return
 	end
 	local outMats, outOccs = table.create(sx), table.create(sx)
@@ -321,7 +339,9 @@ local function clearLand(gx0, gy0, gz0, sx, sy, sz, hasWater, mats, occs, ox, oy
 		end
 		outMats[x], outOccs[x] = matX, occX
 	end
-	pcall(Terrain.WriteVoxels, Terrain, region, VS, outMats, outOccs)
+	pcall(function()
+		Terrain:WriteVoxels(region, VS, outMats, outOccs)
+	end)
 end
 
 -- Queues every section overlapping a voxel box for a rebuild (skipChunk: leave that chunk's own sections alone)
@@ -477,7 +497,7 @@ local function spawnPart(id, shape, wDir, px, py, pz, lenX, lenY, lenZ, faces)
 	if tex then
 		for i = 1, 6 do
 			local face = FACE_LIST[i]
-			if bit32.btest(faces, face[1]) then
+			if faces % (face[1] * 2) >= face[1] then
 				local t = tex:Clone()
 				t.Face = face[2]
 				t.Parent = part
@@ -996,7 +1016,7 @@ local function convertChunk(cx, cy, cz, force)
 					local idx = baseXY + lz
 					if bufSolid[idx] then
 						if not store then
-							store = buffer.create(CHUNK_CELLS * 2)
+							store = bufferLib.create(CHUNK_CELLS * 2)
 						end
 						local li = liXY + lz * CV2
 						writeu8(store, li, bufEffMat[idx])
@@ -1658,6 +1678,8 @@ local function runScheduler()
 		end
 		if not startAreaDone and loadPos > #loadQueue then
 			startAreaDone = true -- start area done: keep converting new chunks in the background only
+			print(string.format("[%s] Start area converted: %d parts (textures: %s)", "Voxel2013", TOTAL_PARTS,
+				HAS_CUSTOM_ASSETS and "on" or "off"))
 		end
 	end
 
@@ -1692,4 +1714,9 @@ local function run2013VoxelConversion()
 	runScheduler()
 end
 
-task.spawn(run2013VoxelConversion)
+task.spawn(function()
+	local ok, err = pcall(run2013VoxelConversion)
+	if not ok then
+		warn("[Voxel2013] failed to start: " .. tostring(err))
+	end
+end)
