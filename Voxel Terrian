@@ -1,42 +1,50 @@
 --[[
-	2013 Roblox Voxel Terrain Converter v11 (Ultra-Swift 1D Buffer & Zero-Lag Edition)
+	2013 Roblox Voxel Terrain Converter v12 (Exact Edits & Section Rebuild Edition)
 	Fixes & Optimizations:
-	1. Eliminated Extreme Lag (85% Fewer Parts & Texture Instances + Zero Table Allocations):
-	   - Pre-allocates reusable flat 1D arrays (bufSolid, bufMat, bufFullBlock, bufEffMat, bufWedgeDir,
-	     bufVisited) instead of allocating 4,900 nested 3D tables per chunk (eliminates 2.5 million
-	     Lua table allocations and garbage collection freezes!)
-	   - Tracks SOLID_FULL_BLOCK[k] separately from SOLID_VOXELS[k] so WedgeParts across chunk borders
-	     are NEVER mistaken for full blocks: every block behind/under a wedge is spawned (zero hidden
-	     missing blocks!) and every side next to a wedge gets its texture (zero missing side textures!),
-	     while genuinely deep underground rock is culled so FPS stays at 60 FPS!
-	2. Swift Loading with Red-Outlined Progress Box:
-	   - Processes 15-25 chunks per frame using flat 1D integer indexing with a smooth 14ms frame budget
-	   - Automatically expands conversion to the entire map as you move around
-	3. Real-Time Terrain Pull-Down (`pullColumnDownTo`):
-	   - Pulls 2013 voxel columns down in real time whenever weapons/tools/scripts lower the terrain
+	1. Exact Terrain Edits (no more extra terrain being removed):
+	   - Roblox sends terrain edits to clients as whole 4x4x4-voxel (16-stud) blocks. Only voxels inside a
+	     block that actually came back from the server are dug out or added, so a shot never removes
+	     terrain outside the blocks it touched (v11 cut away every column above the edit and a ring around it).
+	   - Slopes keep their WedgeParts after an edit (v11 rebuilds turned them into cubes).
+	2. No Lag Or Flashing On Edits:
+	   - Parts are grouped in 8x8x8-voxel (32-stud) sections, so an edit only rebuilds the few sections it
+	     touches; each section is built off-screen and swapped in the same frame.
+	   - Camera probe rays spot returned smooth terrain the frame it arrives, so it is converted before it
+	     can flicker through the 2013 parts.
+	3. Faster Loading:
+	   - Voxels live in one compact byte buffer per 64-stud chunk instead of millions of hash-table entries.
+	   - Parts and textures are cloned from pre-styled templates and parented one section at a time.
+	   - Fully buried chunks stay as hidden smooth terrain until digging reaches them.
+	   - Chunks load nearest-first and you can play while the rest of the map converts.
 ]]
 
 local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
-local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local Terrain = Workspace.Terrain
 
 local CONFIG = {
 	VOXEL_SIZE = 4,                  -- Classic 2013 4x4x4 stud voxel grid
 	OCCUPANCY_MIN = 0.12,            -- Minimum occupancy to form a solid 4x4x4 voxel
-	CHUNK_VOXELS = 16,               -- 16x16x16 voxels (64x64x64 studs) fixed global grid chunks
-	HORIZONTAL_RADIUS = 640,         -- Fast initial radius (1280x1280 studs + auto-converts rest of map as you move)
-	VERTICAL_DOWN = 128,             -- Studs below player/camera to scan initially
-	VERTICAL_UP = 192,               -- Studs above player/camera to scan initially
+	CHUNK_VOXELS = 16,               -- 16x16x16 voxels (64x64x64 studs) fixed global grid load chunks
+	SECTION_VOXELS = 8,              -- 8x8x8 voxels (32x32x32 studs) part groups: an edit only rebuilds these
+	HORIZONTAL_RADIUS = 640,         -- Convert everything within 640 studs of you (follows you as you move)
+	VERTICAL_DOWN = 128,             -- Studs below player/camera to convert
+	VERTICAL_UP = 192,               -- Studs above player/camera to convert
 	GENERATE_2013_WEDGES = true,     -- Place 45-degree WedgeParts on natural surface hill slopes
 	APPLY_2013_TEXTURES = true,      -- Apply embedded 2013 diffuse.dds textures onto all visible faces
 	TEXTURE_STUDS_PER_TILE = 4,      -- 4x4 studs per tile with illumination-flattened seamless textures
 	MICRO_SEAL_3D = 0.002,           -- 3D micro-seal on X, Y, Z to block T-junction seams
-	REALTIME_SYNC = true,            -- Detect when terrain is pulled down / lowered / dug in real time
-	REALTIME_INTERVAL = 0.08,        -- Fast 0.08s real-time scan around player and aimed target
-	FRAME_BUDGET = 0.015             -- Smooth 15ms frame budget (zero frame drops while swiftly loading!)
+	DEFER_BURIED_CHUNKS = true,      -- Leave fully buried chunks as hidden smooth terrain until digging reaches them
+	REALTIME_SYNC = true,            -- Follow terrain dug / added / blown up by weapons, tools and scripts
+	PROBE_RAYS_X = 4,                -- Camera probe grid (4 x 3 + 1 centre ray per frame) that spots edits instantly
+	PROBE_RAYS_Y = 3,
+	PROBE_DISTANCE = 700,            -- Studs the probe rays reach
+	LOAD_BUDGET = 0.014,             -- Seconds per frame spent converting while the start area loads
+	BACKGROUND_LOAD_BUDGET = 0.004,  -- Seconds per frame spent converting new chunks after that
+	EDIT_BUDGET = 0.008              -- Seconds per frame spent applying terrain edits (always runs first)
 }
 
 local EMBEDDED_TEXTURES_B64 = {
@@ -147,128 +155,62 @@ local function init2013Textures()
 	end
 end
 
-local function createStatusBanner()
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "Voxel2013StatusGui"
-	gui.ResetOnSpawn = false
 
-	local ok = pcall(function()
-		gui.Parent = CoreGui
-	end)
-	if not ok then
-		local lp = Players.LocalPlayer
-		if lp then
-			gui.Parent = lp:FindFirstChildOfClass("PlayerGui")
+local floor = math.floor
+
+-- Byte buffers keep the voxel store compact; executors without the buffer library get a plain-table stand-in
+local bufferLib = (type(buffer) == "table" and buffer.create and buffer.readu8 and buffer.writeu8) and buffer or {
+	create = function(size)
+		return table.create(size, 0)
+	end,
+	readu8 = function(b, i)
+		return b[i + 1]
+	end,
+	writeu8 = function(b, i, v)
+		b[i + 1] = v
+	end
+}
+local readu8 = bufferLib.readu8
+local writeu8 = bufferLib.writeu8
+
+local VS = CONFIG.VOXEL_SIZE
+local CV = CONFIG.CHUNK_VOXELS
+local SV = CONFIG.SECTION_VOXELS
+local UV = 4 -- Roblox replicates terrain edits to clients as whole 4x4x4-voxel blocks ("update cells")
+local CV2 = CV * CV
+local CHUNK_CELLS = CV * CV * CV
+local CHUNK_STUDS = CV * VS
+local CELLS_PER_CHUNK = CV / UV
+local SECTIONS_PER_CHUNK = CV / SV
+local MIN_OCC = CONFIG.OCCUPANCY_MIN
+local WEDGE_OCC_MAX = floor(0.85 * 255 + 0.5)
+
+local MAT_AIR = Enum.Material.Air
+local MAT_WATER = Enum.Material.Water
+local MAT_GRASS = Enum.Material.Grass
+local MAT_LEAFY = Enum.Material.LeafyGrass
+
+-- Compact material ids (0 = air) so every voxel fits in a single byte
+local MAT_BY_ID = {}
+local MAT_ID = {}
+
+local function getMatId(mat)
+	local id = MAT_ID[mat]
+	if not id then
+		id = #MAT_BY_ID + 1
+		if id > 255 then
+			return MAT_ID[Enum.Material.Rock]
 		end
+		MAT_BY_ID[id] = mat
+		MAT_ID[mat] = id
 	end
-
-	local frame = Instance.new("Frame")
-	frame.Size = UDim2.new(0, 400, 0, 42)
-	frame.Position = UDim2.new(0.5, -200, 0, 16)
-	frame.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
-	frame.BackgroundTransparency = 0.15
-	frame.BorderSizePixel = 3
-	frame.BorderColor3 = Color3.fromRGB(255, 0, 0)
-	frame.Parent = gui
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(255, 0, 0)
-	stroke.Thickness = 2.5
-	stroke.Parent = frame
-
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, -16, 1, 0)
-	label.Position = UDim2.new(0, 8, 0, 0)
-	label.BackgroundTransparency = 1
-	label.Font = Enum.Font.SourceSansBold
-	label.TextSize = 18
-	label.TextColor3 = Color3.fromRGB(255, 255, 255)
-	label.Text = "2013 Voxel Terrain: Starting..."
-	label.Parent = frame
-
-	return gui, label
+	return id
 end
 
-local function addFaceTexture(part, face, texUrl, tileScale, texTint)
-	local tex = Instance.new("Texture")
-	tex.Name = "Voxel2013Tex"
-	tex.Face = face
-	tex.Texture = texUrl
-	tex.StudsPerTileU = tileScale
-	tex.StudsPerTileV = tileScale
-	tex.OffsetStudsU = 0
-	tex.OffsetStudsV = 0
-	if texTint then
-		tex.Color3 = texTint
-	end
-	tex.Parent = part
-end
-
-local function style2013Part(part, cframe, size, mat, shapeType, expTop, expBottom, expFront, expBack, expLeft, expRight)
-	local info = PALETTE_2013[mat] or PALETTE_2013[Enum.Material.Rock]
-	part.Anchored = true
-	part.CanCollide = true
-	part.CanQuery = true
-	part.CanTouch = true
-
-	if shapeType == "Block" and CONFIG.MICRO_SEAL_3D > 0 then
-		local s = CONFIG.MICRO_SEAL_3D
-		part.Size = Vector3.new(size.X + s, size.Y + s, size.Z + s)
-	else
-		part.Size = size
-	end
-	part.CFrame = cframe
-	part.CastShadow = false
-
-	part.Material = Enum.Material.SmoothPlastic
-	part.Reflectance = 0
-	part.Color = info.Color
-
-	part.TopSurface = Enum.SurfaceType.SmoothNoOutlines
-	part.BottomSurface = Enum.SurfaceType.SmoothNoOutlines
-	part.LeftSurface = Enum.SurfaceType.SmoothNoOutlines
-	part.RightSurface = Enum.SurfaceType.SmoothNoOutlines
-	part.FrontSurface = Enum.SurfaceType.SmoothNoOutlines
-	part.BackSurface = Enum.SurfaceType.SmoothNoOutlines
-
-	local texUrl = HAS_CUSTOM_ASSETS and TEXTURE_ASSETS[info.Key] or nil
-	if texUrl then
-		local tileScale = CONFIG.TEXTURE_STUDS_PER_TILE
-		local tint = info.TexTint
-
-		if shapeType == "Block" then
-			if expTop then addFaceTexture(part, Enum.NormalId.Top, texUrl, tileScale, tint) end
-			if expBottom then addFaceTexture(part, Enum.NormalId.Bottom, texUrl, tileScale, tint) end
-			if expFront then addFaceTexture(part, Enum.NormalId.Front, texUrl, tileScale, tint) end
-			if expBack then addFaceTexture(part, Enum.NormalId.Back, texUrl, tileScale, tint) end
-			if expLeft then addFaceTexture(part, Enum.NormalId.Left, texUrl, tileScale, tint) end
-			if expRight then addFaceTexture(part, Enum.NormalId.Right, texUrl, tileScale, tint) end
-		elseif shapeType == "Wedge" then
-			-- Always texture Front (ramp), Left, Right, and Back of WedgeParts so no wedge side is ever blank!
-			addFaceTexture(part, Enum.NormalId.Front, texUrl, tileScale, tint)
-			addFaceTexture(part, Enum.NormalId.Left, texUrl, tileScale, tint)
-			addFaceTexture(part, Enum.NormalId.Right, texUrl, tileScale, tint)
-			if expBack then addFaceTexture(part, Enum.NormalId.Back, texUrl, tileScale, tint) end
-			if expBottom then addFaceTexture(part, Enum.NormalId.Bottom, texUrl, tileScale, tint) end
-		elseif shapeType == "CornerWedge" then
-			-- Texture all sloped and vertical faces of CornerWedgeParts (the triangle pieces!)
-			addFaceTexture(part, Enum.NormalId.Back, texUrl, tileScale, tint)
-			addFaceTexture(part, Enum.NormalId.Left, texUrl, tileScale, tint)
-			addFaceTexture(part, Enum.NormalId.Front, texUrl, tileScale, tint)
-			addFaceTexture(part, Enum.NormalId.Right, texUrl, tileScale, tint)
-			if expBottom then addFaceTexture(part, Enum.NormalId.Bottom, texUrl, tileScale, tint) end
-		end
-	end
-end
-
-local function snapToVoxel(n)
-	return math.floor(n / CONFIG.VOXEL_SIZE + 0.5) * CONFIG.VOXEL_SIZE
-end
-
-local function snapToChunk(n)
-	local cStuds = CONFIG.CHUNK_VOXELS * CONFIG.VOXEL_SIZE
-	return math.floor(n / cStuds) * cStuds
-end
+local ID_ROCK = getMatId(Enum.Material.Rock)
+local ID_GROUND = getMatId(Enum.Material.Ground)
+local IS_GRASS = { [getMatId(MAT_GRASS)] = true, [getMatId(MAT_LEAFY)] = true }
+local IS_CAP_BASE = { [ID_GROUND] = true, [getMatId(Enum.Material.Mud)] = true, [ID_ROCK] = true }
 
 local function getScanCenter()
 	local lp = Players.LocalPlayer
@@ -284,470 +226,546 @@ local function getScanCenter()
 	return Vector3.new(0, 0, 0)
 end
 
-local function voxelKey(wx, wy, wz)
-	local gx = math.floor(wx * 0.25 + 0.5) + 32768
-	local gy = math.floor(wy * 0.25 + 0.5) + 16384
-	local gz = math.floor(wz * 0.25 + 0.5) + 32768
-	return gx * 4294967296 + gy * 65536 + gz
-end
-
-local function col2DKey(wx, wz)
-	local gx = math.floor(wx * 0.25 + 0.5) + 32768
-	local gz = math.floor(wz * 0.25 + 0.5) + 32768
-	return gx * 131072 + gz
-end
-
+-- Grid coordinates: voxel g spans [g * 4, g * 4 + 4) studs; chunk = floor(g / 16); section = floor(g / 8); cell = floor(g / 4)
 local function chunkKey(cx, cy, cz)
-	local cStuds = CONFIG.CHUNK_VOXELS * CONFIG.VOXEL_SIZE
-	local bx = math.floor(cx / cStuds + 0.5) + 2048
-	local by = math.floor(cy / cStuds + 0.5) + 1024
-	local bz = math.floor(cz / cStuds + 0.5) + 2048
-	return bx * 16777216 + by * 4096 + bz
+	return (cx + 2048) * 16777216 + (cy + 2048) * 4096 + (cz + 2048)
 end
 
-local SOLID_VOXELS = {}       -- [voxelKey] = Enum.Material (all solid land cells, including underground)
-local SOLID_FULL_BLOCK = {}   -- [voxelKey] = true ONLY if cell is a full 4x4x4 Block (NEVER true for Wedges!)
-local ORIGINAL_SURFACE_Y = {} -- [col2DKey] = original surface wy for (wx, wz)
-local CURRENT_TOP_Y = {}      -- [col2DKey] = current top wy for (wx, wz)
-local CHUNK_PARTS = {}        -- [chunkKey] = array of BasePart instances in that 64x64x64 chunk
-local CONVERTED_CHUNKS = {}   -- [chunkKey] = true
-local INTERNAL_WRITE = false
-local INITIAL_LOAD_DONE = false
-local BUSY_SYNC = false
-local CONTAINER = nil
+local function sectionKey(sx, sy, sz)
+	return (sx + 8192) * 268435456 + (sy + 8192) * 16384 + (sz + 8192)
+end
 
--- Pre-allocated reusable 1D buffers for processChunk (ZERO table allocations per chunk = ZERO GC lag!)
-local MAX_BUF = 20 * 20 * 20
+local function cellKey(ux, uy, uz)
+	return (ux + 32768) * 4294967296 + (uy + 32768) * 65536 + (uz + 32768)
+end
+
+local CHUNK_LIVE = {}      -- [chunkKey] = true once the chunk's smooth terrain has been turned into parts
+local CHUNK_DEFERRED = {}  -- [chunkKey] = true for fully buried chunks still left as hidden smooth terrain
+local CHUNK_STORE = {}     -- [chunkKey] = buffer of CHUNK_CELLS material ids then CHUNK_CELLS occupancy bytes (nil = all air)
+local SECTION_FOLDERS = {} -- [sectionKey] = Folder holding that 32-stud section's parts
+local SECTION_PARTS = {}   -- [sectionKey] = {[partSig] = part} so a rebuild can keep the parts that didn't change
+local SECTION_COUNTS = {}  -- [sectionKey] = number of parts in that folder
+local DIRTY_SECTIONS = {}  -- [sectionKey] = {sx, sy, sz} waiting to be rebuilt
+local CONTAINER = nil
+local TOTAL_PARTS = 0
+
+local function storeGet(gx, gy, gz)
+	local cx, cy, cz = floor(gx / CV), floor(gy / CV), floor(gz / CV)
+	local store = CHUNK_STORE[chunkKey(cx, cy, cz)]
+	if not store then
+		return 0, 0
+	end
+	local li = (gx - cx * CV) + (gy - cy * CV) * CV + (gz - cz * CV) * CV2
+	return readu8(store, li), readu8(store, CHUNK_CELLS + li)
+end
+
+local function storeSet(gx, gy, gz, id, occ)
+	local cx, cy, cz = floor(gx / CV), floor(gy / CV), floor(gz / CV)
+	local key = chunkKey(cx, cy, cz)
+	local store = CHUNK_STORE[key]
+	if not store then
+		if id == 0 then
+			return
+		end
+		store = bufferLib.create(CHUNK_CELLS * 2)
+		CHUNK_STORE[key] = store
+	end
+	local li = (gx - cx * CV) + (gy - cy * CV) * CV + (gz - cz * CV) * CV2
+	writeu8(store, li, id)
+	writeu8(store, CHUNK_CELLS + li, occ)
+end
+
+-- Pre-allocated reusable 1D buffers for an n^3 box (a chunk or a section plus 2 voxels of padding)
+local MAX_BUF = (CV + 4) * (CV + 4) * (CV + 4)
 local bufSolid = table.create(MAX_BUF, false)
-local bufMat = table.create(MAX_BUF, Enum.Material.Air)
-local bufFullBlock = table.create(MAX_BUF, false)
-local bufEffMat = table.create(MAX_BUF, Enum.Material.Air)
+local bufMat = table.create(MAX_BUF, 0)
+local bufOcc = table.create(MAX_BUF, 0)
+local bufEffMat = table.create(MAX_BUF, 0)
+local bufFull = table.create(MAX_BUF, false)
 local bufWedgeDir = table.create(MAX_BUF, 0)
 local bufVisited = table.create(MAX_BUF, true)
 local bufWedgeVisited = table.create(MAX_BUF, false)
 
-local function clearChunkParts(cKey)
-	local list = CHUNK_PARTS[cKey]
-	if list then
-		for i = 1, #list do
-			local p = list[i]
-			if p and p.Parent then
-				p:Destroy()
-			end
-		end
-		CHUNK_PARTS[cKey] = nil
-	end
+local function gridRegion(gx0, gy0, gz0, sx, sy, sz)
+	return Region3.new(
+		Vector3.new(gx0 * VS, gy0 * VS, gz0 * VS),
+		Vector3.new((gx0 + sx) * VS, (gy0 + sy) * VS, (gz0 + sz) * VS)
+	):ExpandToGrid(VS)
 end
 
-local function clearChunkSmoothLand(chunkMin, chunkMax, hasWater)
-	local vSize = CONFIG.VOXEL_SIZE
-	local innerRegion = Region3.new(chunkMin, chunkMax):ExpandToGrid(vSize)
-	INTERNAL_WRITE = true
+local function readVoxels(gx0, gy0, gz0, sx, sy, sz)
+	local region = gridRegion(gx0, gy0, gz0, sx, sy, sz)
+	local ok, mats, occs = pcall(function()
+		return Terrain:ReadVoxels(region, VS)
+	end)
+	if not ok or not mats then
+		return nil
+	end
+	local size = mats.Size
+	if size.X ~= sx or size.Y ~= sy or size.Z ~= sz then
+		return nil
+	end
+	return mats, occs
+end
+
+-- Removes smooth land from a voxel box (keeping water) once parts stand in for it.
+-- mats/occs is a ReadVoxels result containing the box; (ox, oy, oz) is the read index of the box's first voxel.
+local function clearLand(gx0, gy0, gz0, sx, sy, sz, hasWater, mats, occs, ox, oy, oz)
+	local region = gridRegion(gx0, gy0, gz0, sx, sy, sz)
 	if not hasWater then
 		pcall(function()
-			Terrain:FillRegion(innerRegion, vSize, Enum.Material.Air)
+			Terrain:FillRegion(region, VS, MAT_AIR)
 		end)
-	else
-		pcall(function()
-			local mats, occs = Terrain:ReadVoxels(innerRegion, vSize)
-			local sz = mats.Size
-			for x = 1, sz.X do
-				for y = 1, sz.Y do
-					for z = 1, sz.Z do
-						if mats[x][y][z] ~= Enum.Material.Water then
-							mats[x][y][z] = Enum.Material.Air
-							occs[x][y][z] = 0
-						end
-					end
+		return
+	end
+	local outMats, outOccs = table.create(sx), table.create(sx)
+	for x = 1, sx do
+		local srcMatX, srcOccX = mats[ox + x - 1], occs[ox + x - 1]
+		local matX, occX = table.create(sy), table.create(sy)
+		for y = 1, sy do
+			local srcMatXY, srcOccXY = srcMatX[oy + y - 1], srcOccX[oy + y - 1]
+			local matXY, occXY = table.create(sz), table.create(sz)
+			for z = 1, sz do
+				local m = srcMatXY[oz + z - 1]
+				if m == MAT_WATER then
+					matXY[z] = m
+					occXY[z] = srcOccXY[oz + z - 1]
+				else
+					matXY[z] = MAT_AIR
+					occXY[z] = 0
 				end
 			end
-			Terrain:WriteVoxels(innerRegion, vSize, mats, occs)
-		end)
+			matX[y], occX[y] = matXY, occXY
+		end
+		outMats[x], outOccs[x] = matX, occX
 	end
-	INTERNAL_WRITE = false
+	pcall(function()
+		Terrain:WriteVoxels(region, VS, outMats, outOccs)
+	end)
 end
 
--- Ultra-fast 1D-buffer chunk processor
-local function processChunk(chunkMin, chunkMax, container, isRebuild)
-	local vSize = CONFIG.VOXEL_SIZE
-	local padVec = Vector3.new(vSize, vSize, vSize)
-	local paddedRegion = Region3.new(chunkMin - padVec, chunkMax + padVec):ExpandToGrid(vSize)
-	local paddedMin = paddedRegion.CFrame.Position - (paddedRegion.Size * 0.5)
+-- Queues every section overlapping a voxel box for a rebuild (skipChunk: leave that chunk's own sections alone)
+local function markDirtyBox(gxa, gya, gza, gxb, gyb, gzb, skipChunk)
+	for sx = floor(gxa / SV), floor(gxb / SV) do
+		for sy = floor(gya / SV), floor(gyb / SV) do
+			for sz = floor(gza / SV), floor(gzb / SV) do
+				local key = sectionKey(sx, sy, sz)
+				if not DIRTY_SECTIONS[key] and (not skipChunk or chunkKey(
+					floor(sx / SECTIONS_PER_CHUNK), floor(sy / SECTIONS_PER_CHUNK), floor(sz / SECTIONS_PER_CHUNK)
+				) ~= skipChunk) then
+					DIRTY_SECTIONS[key] = { sx, sy, sz }
+				end
+			end
+		end
+	end
+end
 
-	local ok, materials, occupancies = pcall(function()
-		return Terrain:ReadVoxels(paddedRegion, vSize)
-	end)
-	if not ok or not materials then
-		return 0
+-- A changed voxel can change its own cell and the faces of its 6 neighbours. If it also changes the shape
+-- of a neighbour (the cell under it, or a surface cell beside it that could be a wedge), that neighbour's
+-- own neighbours are rebuilt too.
+local SHAPE_NEIGHBORS = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 0, 1 }, { 0, 0, -1 }, { 0, -1, 0 } }
+
+local function markVoxelChanged(gx, gy, gz)
+	markDirtyBox(gx - 1, gy - 1, gz - 1, gx + 1, gy + 1, gz + 1)
+	if not CONFIG.GENERATE_2013_WEDGES then
+		return
+	end
+	for d = 1, 5 do
+		local dir = SHAPE_NEIGHBORS[d]
+		local nx, ny, nz = gx + dir[1], gy + dir[2], gz + dir[3]
+		local live = CHUNK_LIVE[chunkKey(floor(nx / CV), floor(ny / CV), floor(nz / CV))]
+		if not live or (storeGet(nx, ny, nz) ~= 0 and (dir[2] == -1 or storeGet(nx, ny + 1, nz) == 0)) then
+			markDirtyBox(nx - 1, ny - 1, nz - 1, nx + 1, ny + 1, nz + 1)
+		end
+	end
+end
+
+-- Pre-styled template per material and shape: cloning one is far cheaper than setting ~20 properties per part
+local SHAPE_BLOCK, SHAPE_WEDGE, SHAPE_CORNER = 0, 1, 2
+local SHAPE_CLASS = { [0] = "Part", [1] = "WedgePart", [2] = "CornerWedgePart" }
+local SHAPE_NAME = { [0] = "Voxel2013_Block", [1] = "Voxel2013_Wedge", [2] = "Voxel2013_CornerWedge" }
+local PART_TEMPLATES = {}
+local TEX_TEMPLATES = {}
+
+local function getPaletteInfo(id)
+	return PALETTE_2013[MAT_BY_ID[id]] or PALETTE_2013[Enum.Material.Rock]
+end
+
+local function getPartTemplate(id, shape)
+	local tKey = shape * 256 + id
+	local template = PART_TEMPLATES[tKey]
+	if not template then
+		local info = getPaletteInfo(id)
+		template = Instance.new(SHAPE_CLASS[shape])
+		template.Name = SHAPE_NAME[shape]
+		template.Anchored = true
+		template.CanCollide = true
+		template.CanQuery = true
+		template.CanTouch = true
+		template.CastShadow = false
+		template.Material = Enum.Material.SmoothPlastic
+		template.Reflectance = 0
+		template.Color = info.Color
+		template.TopSurface = Enum.SurfaceType.SmoothNoOutlines
+		template.BottomSurface = Enum.SurfaceType.SmoothNoOutlines
+		template.LeftSurface = Enum.SurfaceType.SmoothNoOutlines
+		template.RightSurface = Enum.SurfaceType.SmoothNoOutlines
+		template.FrontSurface = Enum.SurfaceType.SmoothNoOutlines
+		template.BackSurface = Enum.SurfaceType.SmoothNoOutlines
+		PART_TEMPLATES[tKey] = template
+	end
+	return template
+end
+
+local function getTexTemplate(id)
+	local template = TEX_TEMPLATES[id]
+	if template == nil then
+		template = false
+		local info = getPaletteInfo(id)
+		local texUrl = HAS_CUSTOM_ASSETS and TEXTURE_ASSETS[info.Key] or nil
+		if texUrl then
+			template = Instance.new("Texture")
+			template.Name = "Voxel2013Tex"
+			template.Texture = texUrl
+			template.StudsPerTileU = CONFIG.TEXTURE_STUDS_PER_TILE
+			template.StudsPerTileV = CONFIG.TEXTURE_STUDS_PER_TILE
+			template.OffsetStudsU = 0
+			template.OffsetStudsV = 0
+			if info.TexTint then
+				template.Color3 = info.TexTint
+			end
+		end
+		TEX_TEMPLATES[id] = template
+	end
+	return template
+end
+
+local FACE_TOP, FACE_BOTTOM, FACE_FRONT, FACE_BACK, FACE_LEFT, FACE_RIGHT = 1, 2, 4, 8, 16, 32
+local FACE_LIST = {
+	{ FACE_TOP, Enum.NormalId.Top },
+	{ FACE_BOTTOM, Enum.NormalId.Bottom },
+	{ FACE_FRONT, Enum.NormalId.Front },
+	{ FACE_BACK, Enum.NormalId.Back },
+	{ FACE_LEFT, Enum.NormalId.Left },
+	{ FACE_RIGHT, Enum.NormalId.Right }
+}
+
+local WEDGE_ROT = {
+	[1] = CFrame.new(Vector3.new(0, 0, 0), Vector3.new(0, 0, -1)),
+	[2] = CFrame.new(Vector3.new(0, 0, 0), Vector3.new(0, 0, 1)),
+	[3] = CFrame.new(Vector3.new(0, 0, 0), Vector3.new(-1, 0, 0)),
+	[4] = CFrame.new(Vector3.new(0, 0, 0), Vector3.new(1, 0, 0)),
+	[5] = CFrame.Angles(0, 0, 0),
+	[6] = CFrame.Angles(0, math.pi * 0.5, 0),
+	[7] = CFrame.Angles(0, math.pi, 0),
+	[8] = CFrame.Angles(0, -math.pi * 0.5, 0)
+}
+
+-- State of the section being meshed
+local meshFolder = nil -- its folder (a new one is made on the first part if it had none)
+local meshOld = nil    -- the parts it had before, by signature: reused when exactly the same part comes out again
+local meshNew = nil    -- the parts it has now, by signature
+local meshCount = 0
+local meshX0, meshY0, meshZ0, meshG0x, meshG0y, meshG0z = 0, 0, 0, 0, 0, 0
+local SV3 = SV * SV * SV
+local SEAL_VEC = Vector3.new(CONFIG.MICRO_SEAL_3D, CONFIG.MICRO_SEAL_3D, CONFIG.MICRO_SEAL_3D)
+
+-- Places a part over cells px .. px + lenX - 1 (etc.) of the box being meshed; wDir is the wedge direction (0 for blocks)
+local function spawnPart(id, shape, wDir, px, py, pz, lenX, lenY, lenZ, faces)
+	local sig = ((((id * 64 + faces) * 16 + wDir) * 4 + shape) * SV3
+		+ ((px - meshX0) * SV + (py - meshY0)) * SV + (pz - meshZ0)) * SV3
+		+ ((lenX - 1) * SV + (lenY - 1)) * SV + (lenZ - 1)
+	meshCount = meshCount + 1
+	local part = meshOld and meshOld[sig]
+	if part then
+		meshOld[sig] = nil
+		meshNew[sig] = part
+		return
 	end
 
-	local size = materials.Size
-	local sx, sy, sz = size.X, size.Y, size.Z
-	if sx < 3 or sy < 3 or sz < 3 then
-		return 0
+	local corner = Vector3.new((meshG0x + px - 1) * VS, (meshG0y + py - 1) * VS, (meshG0z + pz - 1) * VS)
+	local extent = Vector3.new(lenX * VS, lenY * VS, lenZ * VS)
+	part = getPartTemplate(id, shape):Clone()
+	if shape == SHAPE_BLOCK then
+		part.Size = extent + SEAL_VEC
+		part.CFrame = CFrame.new(corner + extent * 0.5)
+	else
+		part.Size = Vector3.new(math.max(lenX, lenZ) * VS, VS, VS)
+		part.CFrame = CFrame.new(corner + extent * 0.5) * WEDGE_ROT[wDir]
+	end
+	local tex = getTexTemplate(id)
+	if tex then
+		for i = 1, 6 do
+			local face = FACE_LIST[i]
+			if faces % (face[1] * 2) >= face[1] then
+				local t = tex:Clone()
+				t.Face = face[2]
+				t.Parent = part
+			end
+		end
+	end
+	if not meshFolder then
+		meshFolder = Instance.new("Folder")
+		meshFolder.Name = "Voxel2013_Section"
+	end
+	part.Parent = meshFolder
+	meshNew[sig] = part
+end
+
+-- Fills the working buffers for an n^3 voxel box whose first voxel is (gx0, gy0, gz0).
+-- Converted chunks come from the voxel store, everything else from the live smooth terrain (read here unless given).
+-- Returns false if the terrain could not be read, else true and whether the box holds any solid voxel.
+local function gatherBox(gx0, gy0, gz0, n, mats, occs)
+	local strideY, strideX = n, n * n
+	local gx1, gy1, gz1 = gx0 + n - 1, gy0 + n - 1, gz0 + n - 1
+	local cx0, cx1 = floor(gx0 / CV), floor(gx1 / CV)
+	local cy0, cy1 = floor(gy0 / CV), floor(gy1 / CV)
+	local cz0, cz1 = floor(gz0 / CV), floor(gz1 / CV)
+
+	if not mats then
+		local needRead = false
+		for cx = cx0, cx1 do
+			for cy = cy0, cy1 do
+				for cz = cz0, cz1 do
+					if not CHUNK_LIVE[chunkKey(cx, cy, cz)] then
+						needRead = true
+					end
+				end
+			end
+		end
+		if needRead then
+			mats, occs = readVoxels(gx0, gy0, gz0, n, n, n)
+			if not mats then
+				return false, false
+			end
+		end
 	end
 
-	local hasAnySmoothLand = false
-	local hasSolidLand = false
-	local hasWater = false
-	local minOcc = CONFIG.OCCUPANCY_MIN
-
-	for px = 2, sx - 1 do
-		local matX = materials[px]
-		local occX = occupancies[px]
-		local wx = math.floor(paddedMin.X + (px - 1) * vSize + 0.5)
-		for py = 2, sy - 1 do
-			local matXY = matX[py]
-			local occXY = occX[py]
-			local wy = math.floor(paddedMin.Y + (py - 1) * vSize + 0.5)
-			for pz = 2, sz - 1 do
-				local mat = matXY[pz]
-				if mat ~= Enum.Material.Air then
-					local occ = occXY[pz]
-					if occ > 0 then
-						if mat == Enum.Material.Water then
-							hasWater = true
-						else
-							hasAnySmoothLand = true
-							if occ < minOcc and (mat == Enum.Material.Grass or mat == Enum.Material.LeafyGrass) then
-								if py - 1 >= 1 and occX[py - 1][pz] >= minOcc then
-									local belowMat = matX[py - 1][pz]
-									if belowMat == Enum.Material.Ground or belowMat == Enum.Material.Mud or belowMat == Enum.Material.Rock then
-										matX[py - 1][pz] = mat
+	local anySolid = false
+	for cx = cx0, cx1 do
+		local xa, xb = math.max(gx0, cx * CV), math.min(gx1, cx * CV + CV - 1)
+		for cy = cy0, cy1 do
+			local ya, yb = math.max(gy0, cy * CV), math.min(gy1, cy * CV + CV - 1)
+			for cz = cz0, cz1 do
+				local za, zb = math.max(gz0, cz * CV), math.min(gz1, cz * CV + CV - 1)
+				local key = chunkKey(cx, cy, cz)
+				if CHUNK_LIVE[key] then
+					local store = CHUNK_STORE[key]
+					for gx = xa, xb do
+						local baseX = (gx - gx0) * strideX
+						local liX = gx - cx * CV
+						for gy = ya, yb do
+							local baseXY = baseX + (gy - gy0) * strideY - gz0 + 1
+							local liXY = liX + (gy - cy * CV) * CV - cz * CV * CV2
+							for gz = za, zb do
+								local idx = baseXY + gz
+								local li = liXY + gz * CV2
+								local m = store and readu8(store, li) or 0
+								if m ~= 0 then
+									bufSolid[idx] = true
+									bufMat[idx] = m
+									bufOcc[idx] = readu8(store, CHUNK_CELLS + li)
+									anySolid = true
+								else
+									bufSolid[idx] = false
+									bufMat[idx] = 0
+									bufOcc[idx] = 0
+								end
+							end
+						end
+					end
+				else
+					for gx = xa, xb do
+						local px = gx - gx0 + 1
+						local baseX = (px - 1) * strideX
+						local matX, occX = mats[px], occs[px]
+						for gy = ya, yb do
+							local py = gy - gy0 + 1
+							local baseXY = baseX + (py - 1) * strideY
+							local matXY, occXY = matX[py], occX[py]
+							local matUp, occUp = matX[py + 1], occX[py + 1]
+							for gz = za, zb do
+								local pz = gz - gz0 + 1
+								local idx = baseXY + pz
+								local mat = matXY[pz]
+								local occ = occXY[pz]
+								if occ >= MIN_OCC and mat ~= MAT_AIR and mat ~= MAT_WATER then
+									local id = getMatId(mat)
+									-- A thin grass cap resting on dirt/rock turns that solid voxel into grass
+									if matUp and IS_CAP_BASE[id] then
+										local upMat = matUp[pz]
+										if upMat == MAT_GRASS or upMat == MAT_LEAFY then
+											local upOcc = occUp[pz]
+											if upOcc > 0 and upOcc < MIN_OCC then
+												id = getMatId(upMat)
+											end
+										end
 									end
+									bufSolid[idx] = true
+									bufMat[idx] = id
+									bufOcc[idx] = floor(occ * 255 + 0.5)
+									anySolid = true
+								else
+									bufSolid[idx] = false
+									bufMat[idx] = 0
+									bufOcc[idx] = 0
 								end
-							elseif occ >= minOcc then
-								hasSolidLand = true
 							end
 						end
 					end
-				elseif isRebuild then
-					local wz = math.floor(paddedMin.Z + (pz - 1) * vSize + 0.5)
-					if SOLID_VOXELS[voxelKey(wx, wy, wz)] then
-						hasSolidLand = true
-					end
 				end
 			end
 		end
 	end
+	return true, anySolid
+end
 
-	local cKey = chunkKey(chunkMin.X, chunkMin.Y, chunkMin.Z)
-	CONVERTED_CHUNKS[cKey] = true
-
-	if not hasAnySmoothLand and not isRebuild then
-		return 0
-	end
-
-	if isRebuild then
-		clearChunkParts(cKey)
-	end
-
-	if not hasSolidLand then
-		if hasAnySmoothLand then
-			clearChunkSmoothLand(chunkMin, chunkMax, hasWater)
-		end
-		return 0
-	end
-
-	local strideY = sz
-	local strideX = sy * sz
-
-	-- Populate 1D bufSolid and bufMat across [1 .. sx, 1 .. sy, 1 .. sz]
-	for px = 1, sx do
+-- Works out the effective material, wedge direction and full-block flag of every cell in [2 .. n-1]^3.
+-- Shapes only depend on the voxel data, so neighbouring chunks and sections always agree on them.
+local function classify(n)
+	local strideY, strideX = n, n * n
+	local wedges = CONFIG.GENERATE_2013_WEDGES
+	for px = 2, n - 1 do
 		local baseX = (px - 1) * strideX
-		local matX = materials[px]
-		local occX = occupancies[px]
-		local wx = math.floor(paddedMin.X + (px - 1) * vSize + 0.5)
-		local isInnerX = (px >= 2 and px <= sx - 1)
-		for py = 1, sy do
+		for py = 2, n - 1 do
 			local baseXY = baseX + (py - 1) * strideY
-			local matXY = matX[py]
-			local occXY = occX[py]
-			local wy = math.floor(paddedMin.Y + (py - 1) * vSize + 0.5)
-			local isInnerXY = isInnerX and (py >= 2 and py <= sy - 1)
-			for pz = 1, sz do
+			for pz = 2, n - 1 do
 				local idx = baseXY + pz
-				local wz = math.floor(paddedMin.Z + (pz - 1) * vSize + 0.5)
-				local k = voxelKey(wx, wy, wz)
-				local mat = matXY[pz]
-				local occ = occXY[pz]
-				if mat ~= Enum.Material.Air and mat ~= Enum.Material.Water and occ >= minOcc then
-					local c2d = col2DKey(wx, wz)
-					if not isRebuild then
-						local curOrig = ORIGINAL_SURFACE_Y[c2d]
-						if not curOrig or wy > curOrig then
-							ORIGINAL_SURFACE_Y[c2d] = wy
-							CURRENT_TOP_Y[c2d] = wy
-						end
-					end
-					local origTop = ORIGINAL_SURFACE_Y[c2d]
-					local resolvedMat = mat
-					if origTop and wy < origTop and (mat == Enum.Material.Grass or mat == Enum.Material.LeafyGrass) then
-						resolvedMat = Enum.Material.Ground
-					end
-
-					bufSolid[idx] = true
-					bufMat[idx] = resolvedMat
-					if isInnerXY and (pz >= 2 and pz <= sz - 1) then
-						SOLID_VOXELS[k] = resolvedMat
-					end
-				elseif SOLID_VOXELS[k] ~= nil then
-					bufSolid[idx] = true
-					bufMat[idx] = SOLID_VOXELS[k]
-				else
-					bufSolid[idx] = false
-					bufMat[idx] = Enum.Material.Air
-				end
-			end
-		end
-	end
-
-	-- Populate bufFullBlock and bufEffMat across [1 .. sx]
-	-- Crucial fix: For already-converted border cells (px=1, sx; pz=1, sz), check SOLID_FULL_BLOCK[k]
-	-- so Wedges in neighboring chunks are NEVER treated as FullBlocks!
-	for px = 1, sx do
-		local baseX = (px - 1) * strideX
-		local wx = math.floor(paddedMin.X + (px - 1) * vSize + 0.5)
-		local isBorderX = (px == 1 or px == sx)
-		for py = 1, sy do
-			local baseXY = baseX + (py - 1) * strideY
-			local wy = math.floor(paddedMin.Y + (py - 1) * vSize + 0.5)
-			local isBorderXY = isBorderX or (py == 1 or py == sy)
-			for pz = 1, sz do
-				local idx = baseXY + pz
-				bufWedgeDir[idx] = 0
 				bufWedgeVisited[idx] = false
+				local wDir = 0
 				if bufSolid[idx] then
-					local wz = math.floor(paddedMin.Z + (pz - 1) * vSize + 0.5)
-					local k = voxelKey(wx, wy, wz)
-					local rawMat = bufMat[idx]
-					local solidAbove = (py < sy) and bufSolid[idx + strideY] or false
-					local origTop = ORIGINAL_SURFACE_Y[col2DKey(wx, wz)]
-					local useMat = rawMat
-					if (solidAbove or (origTop and wy < origTop))
-						and (rawMat == Enum.Material.Grass or rawMat == Enum.Material.LeafyGrass)
-					then
-						useMat = Enum.Material.Ground
+					local id = bufMat[idx]
+					local solidAbove = bufSolid[idx + strideY]
+					if solidAbove and IS_GRASS[id] then
+						id = ID_GROUND
 					end
-					bufEffMat[idx] = useMat
+					bufEffMat[idx] = id
 
-					local isBorder = isBorderXY or (pz == 1 or pz == sz)
-					if not isBorder then
-						SOLID_VOXELS[k] = useMat
-						SOLID_FULL_BLOCK[k] = true
-						bufFullBlock[idx] = true
-					else
-						-- On the 1-voxel padded border: if already converted, use SOLID_FULL_BLOCK[k];
-						-- if not yet converted, only treat as FullBlock if solidAbove or high occupancy (>0.78)
-						if SOLID_FULL_BLOCK[k] ~= nil then
-							bufFullBlock[idx] = SOLID_FULL_BLOCK[k]
-						else
-							local occ = occupancies[px][py][pz]
-							bufFullBlock[idx] = solidAbove or (occ > 0.78)
+					-- Hillside cells become 2013 WedgeParts (wDir 1..4) or CornerWedgePart triangle pieces (wDir 5..8)
+					if wedges and not solidAbove and bufOcc[idx] <= WEDGE_OCC_MAX then
+						local sPosX = bufSolid[idx + strideX]
+						local sNegX = bufSolid[idx - strideX]
+						local sPosZ = bufSolid[idx + 1]
+						local sNegZ = bufSolid[idx - 1]
+						if sPosZ and not sNegZ and (sPosX == sNegX) then
+							wDir = 1
+						elseif sNegZ and not sPosZ and (sPosX == sNegX) then
+							wDir = 2
+						elseif sPosX and not sNegX and (sPosZ == sNegZ) then
+							wDir = 3
+						elseif sNegX and not sPosX and (sPosZ == sNegZ) then
+							wDir = 4
+						elseif (sPosX and 1 or 0) + (sNegX and 1 or 0) + (sPosZ and 1 or 0) + (sNegZ and 1 or 0) == 2 then
+							if sPosX and sNegZ then
+								wDir = 5
+							elseif sNegX and sNegZ then
+								wDir = 6
+							elseif sNegX and sPosZ then
+								wDir = 7
+							elseif sPosX and sPosZ then
+								wDir = 8
+							end
 						end
 					end
+					bufFull[idx] = (wDir == 0)
 				else
-					bufFullBlock[idx] = false
+					bufFull[idx] = false
 				end
+				bufWedgeDir[idx] = wDir
 			end
 		end
 	end
+end
 
-	-- Classify hillside cells into 2013 WedgeParts (wDir 1..4) and CornerWedgePart triangle pieces (wDir 5..8)!
-	if CONFIG.GENERATE_2013_WEDGES and not isRebuild then
-		for px = 2, sx - 1 do
-			local baseX = (px - 1) * strideX
-			local occX = occupancies[px]
-			local wx = math.floor(paddedMin.X + (px - 1) * vSize + 0.5)
-			for py = 2, sy - 1 do
-				local baseXY = baseX + (py - 1) * strideY
-				local occXY = occX[py]
-				local wy = math.floor(paddedMin.Y + (py - 1) * vSize + 0.5)
-				for pz = 2, sz - 1 do
-					local idx = baseXY + pz
-					if bufSolid[idx] and not bufSolid[idx + strideY] then
-						local wz = math.floor(paddedMin.Z + (pz - 1) * vSize + 0.5)
-						local occ = occXY[pz]
-
-						if occ > 0 and occ <= 0.85 then
-							local sPosX = bufSolid[idx + strideX]
-							local sNegX = bufSolid[idx - strideX]
-							local sPosZ = bufSolid[idx + 1]
-							local sNegZ = bufSolid[idx - 1]
-							local nCount = (sPosX and 1 or 0) + (sNegX and 1 or 0) + (sPosZ and 1 or 0) + (sNegZ and 1 or 0)
-
-							local wDir = 0
-							if sPosZ and not sNegZ and (sPosX == sNegX) then
-								wDir = 1
-							elseif sNegZ and not sPosZ and (sPosX == sNegX) then
-								wDir = 2
-							elseif sPosX and not sNegX and (sPosZ == sNegZ) then
-								wDir = 3
-							elseif sNegX and not sPosX and (sPosZ == sNegZ) then
-								wDir = 4
-							elseif nCount == 2 then
-								-- CornerWedgePart triangle pieces on diagonal hill slopes!
-								if sPosX and sNegZ then
-									wDir = 5
-								elseif sNegX and sNegZ then
-									wDir = 6
-								elseif sNegX and sPosZ then
-									wDir = 7
-								elseif sPosX and sPosZ then
-									wDir = 8
-								end
-							end
-
-							if wDir > 0 then
-								bufWedgeDir[idx] = wDir
-								bufFullBlock[idx] = false
-								SOLID_FULL_BLOCK[voxelKey(wx, wy, wz)] = false
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-
-	local chunkPartList = CHUNK_PARTS[cKey]
-	if not chunkPartList then
-		chunkPartList = {}
-		CHUNK_PARTS[cKey] = chunkPartList
-	end
-
-	local createdCount = 0
+-- Greedy-meshes the cells px in [x0, x1], py in [y0, y1], pz in [z0, z1] of a classified n^3 box into parts
+local function meshCells(n, x0, x1, y0, y1, z0, z1)
+	local strideY = n
+	local strideX = n * n
 
 	-- Pass 1: Greedy-mesh 2013 WedgeParts along their width axis
-	for px = 2, sx - 1 do
+	for px = x0, x1 do
 		local baseX = (px - 1) * strideX
-		for py = 2, sy - 1 do
+		for py = y0, y1 do
 			local baseXY = baseX + (py - 1) * strideY
-			for pz = 2, sz - 1 do
+			for pz = z0, z1 do
 				local idx = baseXY + pz
 				local wDir = bufWedgeDir[idx]
 				if wDir > 0 and not bufWedgeVisited[idx] then
 					local mat = bufEffMat[idx]
-					local wx1 = math.floor(paddedMin.X + (px - 1) * vSize + 0.5)
-					local wy1 = math.floor(paddedMin.Y + (py - 1) * vSize + 0.5)
-					local wz1 = math.floor(paddedMin.Z + (pz - 1) * vSize + 0.5)
-
-					if wDir == 1 or wDir == 2 then
-						local endX = px
-						while endX + 1 <= sx - 1 do
-							local nextIdx = idx + (endX + 1 - px) * strideX
+					if wDir <= 4 then
+						-- 1/2 slope along Z and run along X; 3/4 slope along X and run along Z
+						local step = (wDir <= 2) and strideX or 1
+						local runEnd = (wDir <= 2) and (x1 - px) or (z1 - pz)
+						local backOff = (wDir == 1 and 1) or (wDir == 2 and -1) or (wDir == 3 and strideX) or -strideX
+						local len = 1
+						while len <= runEnd do
+							local nextIdx = idx + len * step
 							if not bufWedgeVisited[nextIdx] and bufWedgeDir[nextIdx] == wDir and bufEffMat[nextIdx] == mat then
-								endX = endX + 1
+								len = len + 1
 							else
 								break
 							end
 						end
-						for ix = px, endX do
-							bufWedgeVisited[idx + (ix - px) * strideX] = true
+						local faces = FACE_FRONT + FACE_LEFT + FACE_RIGHT
+						local expBack, expBottom = false, false
+						for i = 0, len - 1 do
+							local cIdx = idx + i * step
+							bufWedgeVisited[cIdx] = true
+							if not bufFull[cIdx + backOff] then expBack = true end
+							if not bufFull[cIdx - strideY] then expBottom = true end
 						end
-						local widthX = (endX - px + 1) * vSize
-						local wSize = Vector3.new(widthX, vSize, vSize)
-						local center = Vector3.new(wx1 + widthX * 0.5, wy1 + vSize * 0.5, wz1 + vSize * 0.5)
-						local lookDir = (wDir == 1) and Vector3.new(0, 0, -1) or Vector3.new(0, 0, 1)
-						local wedge = Instance.new("WedgePart")
-						wedge.Name = "Voxel2013_Wedge"
-						local expBack = (wDir == 1 and not bufFullBlock[idx + 1]) or (wDir == 2 and not bufFullBlock[idx - 1])
-						local expBottom = not bufFullBlock[idx - strideY]
-						style2013Part(wedge, CFrame.new(center, center + lookDir), wSize, mat, "Wedge", true, expBottom, true, expBack, true, true)
-						wedge.Parent = container
-						chunkPartList[#chunkPartList + 1] = wedge
-						createdCount = createdCount + 1
-
-					elseif wDir == 3 or wDir == 4 then
-						local endZ = pz
-						while endZ + 1 <= sz - 1 do
-							local nextIdx = idx + (endZ + 1 - pz)
-							if not bufWedgeVisited[nextIdx] and bufWedgeDir[nextIdx] == wDir and bufEffMat[nextIdx] == mat then
-								endZ = endZ + 1
-							else
-								break
-							end
+						if expBack then faces = faces + FACE_BACK end
+						if expBottom then faces = faces + FACE_BOTTOM end
+						if wDir <= 2 then
+							spawnPart(mat, SHAPE_WEDGE, wDir, px, py, pz, len, 1, 1, faces)
+						else
+							spawnPart(mat, SHAPE_WEDGE, wDir, px, py, pz, 1, 1, len, faces)
 						end
-						for iz = pz, endZ do
-							bufWedgeVisited[idx + (iz - pz)] = true
-						end
-						local widthZ = (endZ - pz + 1) * vSize
-						local wSize = Vector3.new(widthZ, vSize, vSize)
-						local center = Vector3.new(wx1 + vSize * 0.5, wy1 + vSize * 0.5, wz1 + widthZ * 0.5)
-						local lookDir = (wDir == 3) and Vector3.new(-1, 0, 0) or Vector3.new(1, 0, 0)
-						local wedge = Instance.new("WedgePart")
-						wedge.Name = "Voxel2013_Wedge"
-						local expBack = (wDir == 3 and not bufFullBlock[idx + strideX]) or (wDir == 4 and not bufFullBlock[idx - strideX])
-						local expBottom = not bufFullBlock[idx - strideY]
-						style2013Part(wedge, CFrame.new(center, center + lookDir), wSize, mat, "Wedge", true, expBottom, true, expBack, true, true)
-						wedge.Parent = container
-						chunkPartList[#chunkPartList + 1] = wedge
-						createdCount = createdCount + 1
-
-					elseif wDir >= 5 then
+					else
 						-- Spawn the CornerWedgePart triangle piece!
 						bufWedgeVisited[idx] = true
-						local cSize = Vector3.new(vSize, vSize, vSize)
-						local center = Vector3.new(wx1 + vSize * 0.5, wy1 + vSize * 0.5, wz1 + vSize * 0.5)
-						local rotY = 0
-						if wDir == 6 then
-							rotY = math.pi * 0.5
-						elseif wDir == 7 then
-							rotY = math.pi
-						elseif wDir == 8 then
-							rotY = -math.pi * 0.5
+						local faces = FACE_BACK + FACE_LEFT + FACE_FRONT + FACE_RIGHT
+						if not bufFull[idx - strideY] then
+							faces = faces + FACE_BOTTOM
 						end
-						local cWedge = Instance.new("CornerWedgePart")
-						cWedge.Name = "Voxel2013_CornerWedge"
-						local expBottom = not bufFullBlock[idx - strideY]
-						style2013Part(cWedge, CFrame.new(center) * CFrame.Angles(0, rotY, 0), cSize, mat, "CornerWedge", true, expBottom, true, true, true, true)
-						cWedge.Parent = container
-						chunkPartList[#chunkPartList + 1] = cWedge
-						createdCount = createdCount + 1
+						spawnPart(mat, SHAPE_CORNER, wDir, px, py, pz, 1, 1, 1, faces)
 					end
 				end
 			end
 		end
 	end
 
-	-- Mark blocks that are 100% enclosed by 6 FullBlocks (never Wedges!) as visited so FPS stays high
-	-- while every single block behind/under a Wedge or near any surface is spawned!
-	for px = 1, sx do
+	-- Blocks enclosed by 6 FullBlocks (never Wedges!) are skipped so FPS stays high
+	for px = x0, x1 do
 		local baseX = (px - 1) * strideX
-		local isInnerX = (px >= 2 and px <= sx - 1)
-		for py = 1, sy do
+		for py = y0, y1 do
 			local baseXY = baseX + (py - 1) * strideY
-			local isInnerXY = isInnerX and (py >= 2 and py <= sy - 1)
-			for pz = 1, sz do
+			for pz = z0, z1 do
 				local idx = baseXY + pz
-				if isInnerXY and (pz >= 2 and pz <= sz - 1) and bufFullBlock[idx] then
-					bufVisited[idx] = bufFullBlock[idx + strideY]
-						and bufFullBlock[idx - strideY]
-						and bufFullBlock[idx + strideX]
-						and bufFullBlock[idx - strideX]
-						and bufFullBlock[idx + 1]
-						and bufFullBlock[idx - 1]
-				else
-					bufVisited[idx] = true
-				end
+				bufVisited[idx] = not bufFull[idx] or (bufFull[idx + strideY]
+					and bufFull[idx - strideY]
+					and bufFull[idx + strideX]
+					and bufFull[idx - strideX]
+					and bufFull[idx + 1]
+					and bufFull[idx - 1])
 			end
 		end
 	end
 
 	-- Pass 2: Greedy-mesh visible full 4x4x4 blocks across X, Z, and Y using 1D indexing
-	for px = 2, sx - 1 do
+	for px = x0, x1 do
 		local baseX = (px - 1) * strideX
-		for py = 2, sy - 1 do
+		for py = y0, y1 do
 			local baseXY = baseX + (py - 1) * strideY
-			for pz = 2, sz - 1 do
+			for pz = z0, z1 do
 				local idx0 = baseXY + pz
-				if not bufVisited[idx0] and bufFullBlock[idx0] then
+				if not bufVisited[idx0] then
 					local mat = bufEffMat[idx0]
 					local endX, endY, endZ = px, py, pz
 
-					while endX + 1 <= sx - 1 do
+					while endX < x1 do
 						local nIdx = idx0 + (endX + 1 - px) * strideX
-						if not bufVisited[nIdx] and bufFullBlock[nIdx] and bufEffMat[nIdx] == mat then
+						if not bufVisited[nIdx] and bufEffMat[nIdx] == mat then
 							endX = endX + 1
 						else
 							break
@@ -755,11 +773,11 @@ local function processChunk(chunkMin, chunkMax, container, isRebuild)
 					end
 
 					local expandZ = true
-					while endZ + 1 <= sz - 1 and expandZ do
+					while expandZ and endZ < z1 do
 						local zOff = endZ + 1
 						for ix = px, endX do
 							local nIdx = (ix - 1) * strideX + (py - 1) * strideY + zOff
-							if bufVisited[nIdx] or not bufFullBlock[nIdx] or bufEffMat[nIdx] ~= mat then
+							if bufVisited[nIdx] or bufEffMat[nIdx] ~= mat then
 								expandZ = false
 								break
 							end
@@ -770,13 +788,13 @@ local function processChunk(chunkMin, chunkMax, container, isRebuild)
 					end
 
 					local expandY = true
-					while endY + 1 <= sy - 1 and expandY do
-						local yOff = (endY) * strideY
+					while expandY and endY < y1 do
+						local yOff = endY * strideY
 						for ix = px, endX do
 							local xBase = (ix - 1) * strideX + yOff
 							for iz = pz, endZ do
 								local nIdx = xBase + iz
-								if bufVisited[nIdx] or not bufFullBlock[nIdx] or bufEffMat[nIdx] ~= mat then
+								if bufVisited[nIdx] or bufEffMat[nIdx] ~= mat then
 									expandY = false
 									break
 								end
@@ -805,8 +823,8 @@ local function processChunk(chunkMin, chunkMax, container, isRebuild)
 						local topYBase = xBase + endY * strideY
 						local botYBase = xBase + (py - 2) * strideY
 						for iz = pz, endZ do
-							if not bufFullBlock[topYBase + iz] then expTop = true end
-							if not bufFullBlock[botYBase + iz] then expBottom = true end
+							if not bufFull[topYBase + iz] then expTop = true end
+							if not bufFull[botYBase + iz] then expBottom = true end
 							if expTop and expBottom then break end
 						end
 						if expTop and expBottom then break end
@@ -816,8 +834,8 @@ local function processChunk(chunkMin, chunkMax, container, isRebuild)
 						local xBase = (ix - 1) * strideX
 						for iy = py, endY do
 							local xyBase = xBase + (iy - 1) * strideY
-							if not bufFullBlock[xyBase + (pz - 1)] then expFront = true end
-							if not bufFullBlock[xyBase + (endZ + 1)] then expBack = true end
+							if not bufFull[xyBase + (pz - 1)] then expFront = true end
+							if not bufFull[xyBase + (endZ + 1)] then expBack = true end
 							if expFront and expBack then break end
 						end
 						if expFront and expBack then break end
@@ -830,283 +848,852 @@ local function processChunk(chunkMin, chunkMax, container, isRebuild)
 						local lBase = leftXBase + yOff
 						local rBase = rightXBase + yOff
 						for iz = pz, endZ do
-							if not bufFullBlock[lBase + iz] then expLeft = true end
-							if not bufFullBlock[rBase + iz] then expRight = true end
+							if not bufFull[lBase + iz] then expLeft = true end
+							if not bufFull[rBase + iz] then expRight = true end
 							if expLeft and expRight then break end
 						end
 						if expLeft and expRight then break end
 					end
 
-					local boxCells = Vector3.new(endX - px + 1, endY - py + 1, endZ - pz + 1)
-					local partSize = boxCells * vSize
-					local wx1 = math.floor(paddedMin.X + (px - 1) * vSize + 0.5)
-					local wy1 = math.floor(paddedMin.Y + (py - 1) * vSize + 0.5)
-					local wz1 = math.floor(paddedMin.Z + (pz - 1) * vSize + 0.5)
-					local startCorner = Vector3.new(wx1, wy1, wz1)
-					local centerPos = startCorner + (partSize * 0.5)
-
-					local block = Instance.new("Part")
-					block.Name = "Voxel2013_Block"
-					style2013Part(block, CFrame.new(centerPos), partSize, mat, "Block", expTop, expBottom, expFront, expBack, expLeft, expRight)
-					block.Parent = container
-					chunkPartList[#chunkPartList + 1] = block
-					createdCount = createdCount + 1
+					local faces = (expTop and FACE_TOP or 0) + (expBottom and FACE_BOTTOM or 0)
+						+ (expFront and FACE_FRONT or 0) + (expBack and FACE_BACK or 0)
+						+ (expLeft and FACE_LEFT or 0) + (expRight and FACE_RIGHT or 0)
+					spawnPart(mat, SHAPE_BLOCK, 0, px, py, pz, endX - px + 1, endY - py + 1, endZ - pz + 1, faces)
 				end
 			end
 		end
 	end
-
-	clearChunkSmoothLand(chunkMin, chunkMax, hasWater)
-	return createdCount
 end
 
-local function rebuildAlignedChunksInBox(minVec, maxVec, removeSphereCenter, removeSphereRadius)
-	if not CONTAINER or not CONTAINER.Parent then return end
-	local vSize = CONFIG.VOXEL_SIZE
-	local cStuds = CONFIG.CHUNK_VOXELS * vSize
+-- Meshes one section of the classified box. Parts that come out exactly as before are kept, the rest are
+-- created / destroyed, all in the same frame so the section never flashes.
+local function buildSection(sx, sy, sz, n, x0, y0, z0, g0x, g0y, g0z, anySolid)
+	local key = sectionKey(sx, sy, sz)
+	local oldFolder = SECTION_FOLDERS[key]
+	meshFolder, meshOld, meshNew, meshCount = oldFolder, SECTION_PARTS[key], {}, 0
+	meshX0, meshY0, meshZ0, meshG0x, meshG0y, meshG0z = x0, y0, z0, g0x, g0y, g0z
+	if anySolid then
+		meshCells(n, x0, x0 + SV - 1, y0, y0 + SV - 1, z0, z0 + SV - 1)
+	end
+	if meshOld then
+		for _, part in pairs(meshOld) do
+			part:Destroy()
+		end
+	end
 
-	if removeSphereCenter and removeSphereRadius then
-		local rExpand = removeSphereRadius + vSize * 0.5
-		local rSq = rExpand * rExpand
-		local sx1 = snapToVoxel(removeSphereCenter.X - rExpand)
-		local sx2 = snapToVoxel(removeSphereCenter.X + rExpand)
-		local sy1 = snapToVoxel(removeSphereCenter.Y - rExpand)
-		local sy2 = snapToVoxel(removeSphereCenter.Y + rExpand)
-		local sz1 = snapToVoxel(removeSphereCenter.Z - rExpand)
-		local sz2 = snapToVoxel(removeSphereCenter.Z + rExpand)
-		for wx = sx1, sx2, vSize do
-			for wy = sy1, sy2, vSize do
-				for wz = sz1, sz2, vSize do
-					local dx = (wx + vSize * 0.5) - removeSphereCenter.X
-					local dy = (wy + vSize * 0.5) - removeSphereCenter.Y
-					local dz = (wz + vSize * 0.5) - removeSphereCenter.Z
-					if (dx * dx + dy * dy + dz * dz) <= rSq then
-						local k = voxelKey(wx, wy, wz)
-						SOLID_VOXELS[k] = nil
-						SOLID_FULL_BLOCK[k] = nil
+	local folder, count = meshFolder, meshCount
+	if folder and count == 0 then
+		folder:Destroy()
+		folder = nil
+	end
+	SECTION_FOLDERS[key] = folder
+	SECTION_PARTS[key] = (count > 0) and meshNew or nil
+	TOTAL_PARTS = TOTAL_PARTS + count - (SECTION_COUNTS[key] or 0)
+	SECTION_COUNTS[key] = (count > 0) and count or nil
+	meshFolder, meshOld, meshNew = nil, nil, nil
+	if folder and folder ~= oldFolder then
+		folder.Parent = CONTAINER
+	end
+end
+
+local function rebuildSection(sx, sy, sz)
+	if not CHUNK_LIVE[chunkKey(floor(sx / SECTIONS_PER_CHUNK), floor(sy / SECTIONS_PER_CHUNK), floor(sz / SECTIONS_PER_CHUNK))] then
+		return -- not converted yet: the loader builds it from live terrain
+	end
+	local n = SV + 4
+	local g0x, g0y, g0z = sx * SV - 2, sy * SV - 2, sz * SV - 2
+	local ok, anySolid = gatherBox(g0x, g0y, g0z, n)
+	if not ok then
+		return
+	end
+	if anySolid then
+		classify(n)
+	end
+	buildSection(sx, sy, sz, n, 3, 3, 3, g0x, g0y, g0z, anySolid)
+end
+
+-- Converts one 64-stud chunk of smooth terrain into 2013 parts (force = convert even if fully buried)
+local function convertChunk(cx, cy, cz, force)
+	local key = chunkKey(cx, cy, cz)
+	if CHUNK_LIVE[key] then
+		return
+	end
+	local n = CV + 4
+	local gx0, gy0, gz0 = cx * CV - 2, cy * CV - 2, cz * CV - 2
+	local mats, occs = readVoxels(gx0, gy0, gz0, n, n, n)
+	if not mats then
+		CHUNK_LIVE[key] = true -- anything left behind gets picked up by the realtime sync
+		CHUNK_DEFERRED[key] = nil
+		return
+	end
+
+	-- Quick look first: any land in the chunk itself? any water? solid all the way through?
+	local hasLand, hasWater, allSolid = false, false, true
+	for px = 3, n - 2 do
+		local matX, occX = mats[px], occs[px]
+		for py = 3, n - 2 do
+			local matXY, occXY = matX[py], occX[py]
+			for pz = 3, n - 2 do
+				local mat = matXY[pz]
+				local occ = occXY[pz]
+				if occ > 0 then
+					if mat == MAT_WATER then
+						hasWater = true
+					elseif mat ~= MAT_AIR then
+						hasLand = true
+					end
+				end
+				if allSolid and (occ < MIN_OCC or mat == MAT_AIR or mat == MAT_WATER) then
+					allSolid = false
+				end
+			end
+		end
+	end
+	if not hasLand then
+		CHUNK_LIVE[key] = true
+		CHUNK_DEFERRED[key] = nil
+		return
+	end
+
+	local _, anySolid = gatherBox(gx0, gy0, gz0, n, mats, occs)
+	local strideY, strideX = n, n * n
+
+	-- Buried under solid voxels on every side? Then no face of it can be seen: leave it as smooth terrain
+	if allSolid and not force and CONFIG.DEFER_BURIED_CHUNKS then
+		local buried = true
+		for px = 2, n - 1 do
+			local baseX = (px - 1) * strideX
+			local edgeX = px == 2 or px == n - 1
+			for py = 2, n - 1 do
+				local baseXY = baseX + (py - 1) * strideY
+				local edgeXY = edgeX or py == 2 or py == n - 1
+				for pz = 2, n - 1 do
+					local idx = baseXY + pz
+					if (edgeXY or pz == 2 or pz == n - 1) and not bufSolid[idx] then
+						buried = false
+						break
+					end
+				end
+				if not buried then break end
+			end
+			if not buried then break end
+		end
+		if buried and CONFIG.GENERATE_2013_WEDGES then
+			-- The padding layer above could still hold wedges (open faces) if nothing solid sits on top of it
+			local baseY = (n - 2) * strideY
+			for px = 2, n - 1 do
+				local baseXY = (px - 1) * strideX + baseY
+				for pz = 2, n - 1 do
+					local idx = baseXY + pz
+					if bufOcc[idx] <= WEDGE_OCC_MAX and not bufSolid[idx + strideY] then
+						buried = false
+						break
+					end
+				end
+				if not buried then break end
+			end
+		end
+		if buried then
+			CHUNK_DEFERRED[key] = true
+			return
+		end
+	end
+	CHUNK_DEFERRED[key] = nil
+
+	if anySolid then
+		classify(n)
+	end
+
+	-- Save the chunk's voxels (with resolved materials) so edits can be applied exactly later on
+	local store = nil
+	if anySolid then
+		for lx = 0, CV - 1 do
+			local baseX = (lx + 2) * strideX
+			for ly = 0, CV - 1 do
+				local baseXY = baseX + (ly + 2) * strideY + 3
+				local liXY = lx + ly * CV
+				for lz = 0, CV - 1 do
+					local idx = baseXY + lz
+					if bufSolid[idx] then
+						if not store then
+							store = bufferLib.create(CHUNK_CELLS * 2)
+						end
+						local li = liXY + lz * CV2
+						writeu8(store, li, bufEffMat[idx])
+						writeu8(store, CHUNK_CELLS + li, bufOcc[idx])
 					end
 				end
 			end
 		end
 	end
+	CHUNK_STORE[key] = store
+	CHUNK_LIVE[key] = true
 
-	local cMinX = snapToChunk(minVec.X)
-	local cMaxX = snapToChunk(maxVec.X)
-	local cMinY = snapToChunk(minVec.Y)
-	local cMaxY = snapToChunk(maxVec.Y)
-	local cMinZ = snapToChunk(minVec.Z)
-	local cMaxZ = snapToChunk(maxVec.Z)
-
-	for cx = cMinX, cMaxX, cStuds do
-		for cy = cMinY, cMaxY, cStuds do
-			for cz = cMinZ, cMaxZ, cStuds do
-				local cMin = Vector3.new(cx, cy, cz)
-				local cMax = Vector3.new(cx + cStuds, cy + cStuds, cz + cStuds)
-				processChunk(cMin, cMax, CONTAINER, true)
-			end
-		end
-	end
-end
-
-local function pullColumnDownTo(wx, wz, newTopY, maxClearY)
-	local vSize = CONFIG.VOXEL_SIZE
-	local c2d = col2DKey(wx, wz)
-	local prevTop = CURRENT_TOP_Y[c2d] or ORIGINAL_SURFACE_Y[c2d] or maxClearY
-	local topLimit = math.max(prevTop, maxClearY)
-
-	for wy = newTopY + vSize, topLimit, vSize do
-		local k = voxelKey(wx, wy, wz)
-		SOLID_VOXELS[k] = nil
-		SOLID_FULL_BLOCK[k] = nil
-	end
-
-	for wy = newTopY - vSize * 2, newTopY, vSize do
-		local k = voxelKey(wx, wy, wz)
-		if not SOLID_VOXELS[k] or SOLID_VOXELS[k] == Enum.Material.Grass or SOLID_VOXELS[k] == Enum.Material.LeafyGrass then
-			SOLID_VOXELS[k] = Enum.Material.Ground
-			SOLID_FULL_BLOCK[k] = true
-		end
-	end
-
-	CURRENT_TOP_Y[c2d] = newTopY
-end
-
-local function checkAndConvertModifiedRegion(scanMin, scanMax)
-	if not INITIAL_LOAD_DONE or BUSY_SYNC or not CONTAINER or not CONTAINER.Parent then
-		return
-	end
-	BUSY_SYNC = true
-
-	local vSize = CONFIG.VOXEL_SIZE
-	local region = Region3.new(scanMin, scanMax):ExpandToGrid(vSize)
-	local actualMin = region.CFrame.Position - (region.Size * 0.5)
-
-	local ok, mats, occs = pcall(function()
-		return Terrain:ReadVoxels(region, vSize)
-	end)
-	if not ok or not mats then
-		BUSY_SYNC = false
-		return
-	end
-
-	local sz = mats.Size
-	local minIx, minIy, minIz = sz.X + 1, sz.Y + 1, sz.Z + 1
-	local maxIx, maxIy, maxIz = 0, 0, 0
-	local foundModified = false
-
-	local colHighestY = {}
-	local colHighestOcc = {}
-
-	for x = 1, sz.X do
-		local matX = mats[x]
-		local occX = occs[x]
-		for y = 1, sz.Y do
-			local matXY = matX[y]
-			local occXY = occX[y]
-			for z = 1, sz.Z do
-				local mat = matXY[z]
-				local occ = occXY[z]
-				if mat ~= Enum.Material.Air and mat ~= Enum.Material.Water and occ > 0 then
-					foundModified = true
-					if x < minIx then minIx = x end
-					if y < minIy then minIy = y end
-					if z < minIz then minIz = z end
-					if x > maxIx then maxIx = x end
-					if y > maxIy then maxIy = y end
-					if z > maxIz then maxIz = z end
-
-					local xzKey = x * 1024 + z
-					if not colHighestY[xzKey] or y >= colHighestY[xzKey] then
-						colHighestY[xzKey] = y
-						colHighestOcc[xzKey] = occ
-					end
-				end
-			end
-		end
-	end
-
-	if foundModified then
-		local maxScanWY = math.floor(actualMin.Y + (sz.Y - 1) * vSize + 0.5) + 16
-		local xStart = math.max(1, minIx - 1)
-		local xEnd = math.min(sz.X, maxIx + 1)
-		local zStart = math.max(1, minIz - 1)
-		local zEnd = math.min(sz.Z, maxIz + 1)
-
-		for x = xStart, xEnd do
-			local wx = math.floor(actualMin.X + (x - 1) * vSize + 0.5)
-			for z = zStart, zEnd do
-				local wz = math.floor(actualMin.Z + (z - 1) * vSize + 0.5)
-				local xzKey = x * 1024 + z
-				local topIy = colHighestY[xzKey]
-
-				if topIy then
-					local wy = math.floor(actualMin.Y + (topIy - 1) * vSize + 0.5)
-					local occ = colHighestOcc[xzKey]
-					local newTopWY = (occ >= CONFIG.OCCUPANCY_MIN) and wy or (wy - vSize)
-					pullColumnDownTo(wx, wz, newTopWY, maxScanWY)
-				end
-
-				for y = minIy, math.min(sz.Y, maxIy + 4) do
-					if mats[x][y][z] == Enum.Material.Air or occs[x][y][z] < CONFIG.OCCUPANCY_MIN then
-						local wy = math.floor(actualMin.Y + (y - 1) * vSize + 0.5)
-						local k = voxelKey(wx, wy, wz)
-						SOLID_VOXELS[k] = nil
-						SOLID_FULL_BLOCK[k] = nil
-					end
-				end
-			end
-		end
-
-		local dirtyMinX = math.floor(actualMin.X + (xStart - 1) * vSize + 0.5)
-		local dirtyMinY = math.floor(actualMin.Y + (minIy - 1) * vSize + 0.5) - vSize * 2
-		local dirtyMinZ = math.floor(actualMin.Z + (zStart - 1) * vSize + 0.5)
-		local dirtyMaxX = math.floor(actualMin.X + (xEnd - 1) * vSize + 0.5)
-		local dirtyMaxY = math.floor(actualMin.Y + (maxIy - 1) * vSize + 0.5) + 24
-		local dirtyMaxZ = math.floor(actualMin.Z + (zEnd - 1) * vSize + 0.5)
-
-		rebuildAlignedChunksInBox(
-			Vector3.new(dirtyMinX, dirtyMinY, dirtyMinZ),
-			Vector3.new(dirtyMaxX, dirtyMaxY, dirtyMaxZ),
-			nil, nil
-		)
-	end
-
-	BUSY_SYNC = false
-end
-
-local function startRealtimeTerrainSync()
-	if not CONFIG.REALTIME_SYNC then
-		return
-	end
-
-	Workspace.DescendantAdded:Connect(function(obj)
-		if obj:IsA("Explosion") then
-			task.defer(function()
-				if not INITIAL_LOAD_DONE then return end
-				local r = obj.BlastRadius
-				if r and r > 0 then
-					local pos = obj.Position
-					local rVec = Vector3.new(r + 8, r + 8, r + 8)
-					rebuildAlignedChunksInBox(pos - rVec, pos + rVec, pos, r)
-				end
-			end)
-		end
-	end)
-
-	UserInputService.InputBegan:Connect(function(input)
-		if not INITIAL_LOAD_DONE then return end
-		if input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch
-		then
-			task.delay(0.05, function()
-				local center = getScanCenter()
-				local cam = Workspace.CurrentCamera
-				local lookCenter = cam and (center + cam.CFrame.LookVector * 18) or center
-				local r = 56
-				checkAndConvertModifiedRegion(
-					Vector3.new(snapToVoxel(lookCenter.X - r), snapToVoxel(lookCenter.Y - r), snapToVoxel(lookCenter.Z - r)),
-					Vector3.new(snapToVoxel(lookCenter.X + r), snapToVoxel(lookCenter.Y + r), snapToVoxel(lookCenter.Z + r))
+	for i = 0, SECTIONS_PER_CHUNK - 1 do
+		for j = 0, SECTIONS_PER_CHUNK - 1 do
+			for k = 0, SECTIONS_PER_CHUNK - 1 do
+				buildSection(
+					cx * SECTIONS_PER_CHUNK + i, cy * SECTIONS_PER_CHUNK + j, cz * SECTIONS_PER_CHUNK + k,
+					n, 3 + i * SV, 3 + j * SV, 3 + k * SV, gx0, gy0, gz0, store ~= nil
 				)
-			end)
+			end
 		end
-	end)
+	end
 
-	task.spawn(function()
-		local cStuds = CONFIG.CHUNK_VOXELS * CONFIG.VOXEL_SIZE
-		while CONTAINER and CONTAINER.Parent do
-			task.wait(CONFIG.REALTIME_INTERVAL)
-			if INITIAL_LOAD_DONE and not BUSY_SYNC then
-				local c = getScanCenter()
-				local r = 64
-				checkAndConvertModifiedRegion(
-					Vector3.new(snapToVoxel(c.X - r), snapToVoxel(c.Y - 48), snapToVoxel(c.Z - r)),
-					Vector3.new(snapToVoxel(c.X + r), snapToVoxel(c.Y + 48), snapToVoxel(c.Z + r))
-				)
+	clearLand(cx * CV, cy * CV, cz * CV, CV, CV, CV, hasWater, mats, occs, 3, 3, 3)
+end
 
-				-- Swiftly convert any new distant chunks as the player walks across the map
-				local baseCX = snapToChunk(c.X)
-				local baseCY = snapToChunk(c.Y)
-				local baseCZ = snapToChunk(c.Z)
-				local lastY = os.clock()
-				for dx = -4, 4 do
-					for dz = -4, 4 do
-						for dy = -2, 2 do
-							local cx = baseCX + dx * cStuds
-							local cy = baseCY + dy * cStuds
-							local cz = baseCZ + dz * cStuds
-							if not CONVERTED_CHUNKS[chunkKey(cx, cy, cz)] then
-								processChunk(Vector3.new(cx, cy, cz), Vector3.new(cx + cStuds, cy + cStuds, cz + cStuds), CONTAINER, false)
-								if os.clock() - lastY >= 0.010 then
-									task.wait()
-									lastY = os.clock()
-								end
+------------------------------------------------------------------------------------------------
+-- Real-time terrain sync
+-- When the server digs, adds or blows up terrain it sends every touched 4x4x4-voxel block back to us in
+-- full. Land showing up inside a converted chunk is exactly such a block, so its contents (air included)
+-- are the server's truth for that block; voxels outside returned blocks are never touched.
+------------------------------------------------------------------------------------------------
+
+local SYNC_URGENT = {}
+local SYNC_NORMAL = {}
+local SYNC_PENDING = {}    -- [jobKey] = job still waiting in a queue
+local CONVERT_URGENT = {}  -- buried chunks digging has reached
+local CONVERT_PENDING = {}
+local FLOOD_COOLDOWN = {}  -- [job box] = time before which an edit isn't followed into that box again
+local RECENT_FRESH = {}    -- ring of {time, ux, uy, uz} for recently returned blocks
+local recentFreshPos = 0
+local NEIGHBOR_DIRS = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } }
+
+local function queueSync(ux0, uy0, uz0, ux1, uy1, uz1, urgent, explosion)
+	local jobKey = string.format("%d,%d,%d,%d,%d,%d", ux0, uy0, uz0, ux1, uy1, uz1)
+	local job = SYNC_PENDING[jobKey]
+	if job then
+		job.explosion = explosion or job.explosion
+		if urgent and not job.urgent then
+			job.urgent = true
+			table.insert(SYNC_URGENT, job)
+		end
+		return
+	end
+	job = { ux0, uy0, uz0, ux1, uy1, uz1, key = jobKey, urgent = urgent, explosion = explosion }
+	SYNC_PENDING[jobKey] = job
+	table.insert(urgent and SYNC_URGENT or SYNC_NORMAL, job)
+end
+
+local function queueConvert(cx, cy, cz)
+	local key = chunkKey(cx, cy, cz)
+	if CHUNK_DEFERRED[key] and not CONVERT_PENDING[key] then
+		CONVERT_PENDING[key] = true
+		table.insert(CONVERT_URGENT, { cx, cy, cz })
+	end
+end
+
+local function queueSyncAround(pos, urgent)
+	local ux, uy, uz = floor(pos.X / (UV * VS)), floor(pos.Y / (UV * VS)), floor(pos.Z / (UV * VS))
+	queueSync(ux - 1, uy - 1, uz - 1, ux + 1, uy + 1, uz + 1, urgent)
+	-- Wake up buried chunks right next to where you're digging before the hole reaches them
+	for cx = floor((pos.X - 16) / CHUNK_STUDS), floor((pos.X + 16) / CHUNK_STUDS) do
+		for cy = floor((pos.Y - 16) / CHUNK_STUDS), floor((pos.Y + 16) / CHUNK_STUDS) do
+			for cz = floor((pos.Z - 16) / CHUNK_STUDS), floor((pos.Z + 16) / CHUNK_STUDS) do
+				queueConvert(cx, cy, cz)
+			end
+		end
+	end
+end
+
+local function pushRecentFresh(ux, uy, uz)
+	recentFreshPos = recentFreshPos % 256 + 1
+	RECENT_FRESH[recentFreshPos] = { os.clock(), ux, uy, uz }
+end
+
+local function distSqToVoxel(gx, gy, gz, center)
+	local dx = (gx + 0.5) * VS - center.X
+	local dy = (gy + 0.5) * VS - center.Y
+	local dz = (gz + 0.5) * VS - center.Z
+	return dx * dx + dy * dy + dz * dz
+end
+
+-- A block an explosion empties completely comes back as plain air, which looks just like terrain we cleared
+-- ourselves. The blocks that did come back show how far the crater really reached (craters are only "roughly"
+-- BlastRadius): nothing closer to the centre than the nearest surviving voxel is left, so empty blocks lying
+-- entirely inside that distance are cleared.
+local function clearBlastInterior(ux0, uy0, uz0, ux1, uy1, uz1, center, radius)
+	local now = os.clock()
+	local returned = {}
+	local anyReturned = false
+	local reach = radius + VS
+	local innerSq = reach * reach
+	for _, e in ipairs(RECENT_FRESH) do
+		local ux, uy, uz = e[2], e[3], e[4]
+		if now - e[1] < 3 and ux >= ux0 and ux <= ux1 and uy >= uy0 and uy <= uy1 and uz >= uz0 and uz <= uz1 then
+			local ck = cellKey(ux, uy, uz)
+			if not returned[ck] then
+				returned[ck] = true
+				anyReturned = true
+				for gx = ux * UV, ux * UV + UV - 1 do
+					for gy = uy * UV, uy * UV + UV - 1 do
+						for gz = uz * UV, uz * UV + UV - 1 do
+							if storeGet(gx, gy, gz) ~= 0 then
+								innerSq = math.min(innerSq, distSqToVoxel(gx, gy, gz, center))
 							end
 						end
 					end
 				end
 			end
 		end
+	end
+	if not anyReturned then
+		return -- no sign the server cratered anything here
+	end
+
+	for ux = ux0, ux1 do
+		for uy = uy0, uy1 do
+			for uz = uz0, uz1 do
+				if not returned[cellKey(ux, uy, uz)] and CHUNK_LIVE[chunkKey(
+					floor(ux / CELLS_PER_CHUNK), floor(uy / CELLS_PER_CHUNK), floor(uz / CELLS_PER_CHUNK)
+				)] then
+					local gxa, gya, gza = ux * UV, uy * UV, uz * UV
+					local found, inside = false, true
+					for gx = gxa, gxa + UV - 1 do
+						for gy = gya, gya + UV - 1 do
+							for gz = gza, gza + UV - 1 do
+								if inside and storeGet(gx, gy, gz) ~= 0 then
+									found = true
+									if distSqToVoxel(gx, gy, gz, center) >= innerSq then
+										inside = false
+									end
+								end
+							end
+						end
+					end
+					if found and inside then
+						for gx = gxa, gxa + UV - 1 do
+							for gy = gya, gya + UV - 1 do
+								for gz = gza, gza + UV - 1 do
+									storeSet(gx, gy, gz, 0, 0)
+								end
+							end
+						end
+						markDirtyBox(gxa - 2, gya - 2, gza - 2, gxa + UV + 1, gya + UV + 1, gza + UV + 1)
+					end
+				end
+			end
+		end
+	end
+end
+
+-- Looks for returned blocks in a box of update cells and applies them to the voxel store
+local function syncCells(job)
+	local ux0, uy0, uz0, ux1, uy1, uz1 = job[1], job[2], job[3], job[4], job[5], job[6]
+	local gx0, gy0, gz0 = ux0 * UV, uy0 * UV, uz0 * UV
+	-- One extra voxel layer on top so grass/dirt can be resolved for each block's top row
+	local mats, occs = readVoxels(gx0, gy0, gz0, (ux1 - ux0 + 1) * UV, (uy1 - uy0 + 1) * UV + 1, (uz1 - uz0 + 1) * UV)
+	if not mats then
+		return
+	end
+
+	-- 1) Find returned blocks: any land at all in a block of a converted chunk
+	local freshList = {}
+	local freshSet = {}
+	local convertList = nil
+	for ux = ux0, ux1 do
+		local cx = floor(ux / CELLS_PER_CHUNK)
+		local bx = (ux - ux0) * UV
+		for uy = uy0, uy1 do
+			local cy = floor(uy / CELLS_PER_CHUNK)
+			local by = (uy - uy0) * UV
+			for uz = uz0, uz1 do
+				local cz = floor(uz / CELLS_PER_CHUNK)
+				local bz = (uz - uz0) * UV
+				local cKey = chunkKey(cx, cy, cz)
+				if CHUNK_LIVE[cKey] then
+					local hasLandHere, hasWaterHere = false, false
+					for x = bx + 1, bx + UV do
+						local matX, occX = mats[x], occs[x]
+						for y = by + 1, by + UV do
+							local matXY, occXY = matX[y], occX[y]
+							for z = bz + 1, bz + UV do
+								if occXY[z] > 0 then
+									local m = matXY[z]
+									if m == MAT_WATER then
+										hasWaterHere = true
+									elseif m ~= MAT_AIR then
+										hasLandHere = true
+									end
+								end
+							end
+						end
+					end
+					if hasLandHere then
+						if CHUNK_STORE[cKey] then
+							local cell = { ux, uy, uz, hasWaterHere }
+							freshList[#freshList + 1] = cell
+							freshSet[cellKey(ux, uy, uz)] = cell
+						elseif not (convertList and convertList[cKey]) then
+							-- Terrain arrived in a chunk that was empty (streamed in / built): convert it whole
+							convertList = convertList or {}
+							convertList[cKey] = { cx, cy, cz }
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if convertList then
+		for cKey, c in pairs(convertList) do
+			CHUNK_LIVE[cKey] = nil
+			convertChunk(c[1], c[2], c[3], false)
+			-- Neighbouring sections were built while this chunk was still empty air
+			local gxa, gya, gza = c[1] * CV, c[2] * CV, c[3] * CV
+			markDirtyBox(gxa - 2, gya - 2, gza - 2, gxa + CV + 1, gya + CV + 1, gza + CV + 1, cKey)
+		end
+	end
+
+	-- 2) Apply each returned block voxel by voxel; only voxels that really changed rebuild anything
+	for i = 1, #freshList do
+		local cell = freshList[i]
+		local ux, uy, uz = cell[1], cell[2], cell[3]
+		local bx, by, bz = (ux - ux0) * UV, (uy - uy0) * UV, (uz - uz0) * UV
+		local aboveReturned = freshSet[cellKey(ux, uy + 1, uz)] ~= nil
+		for lx = 1, UV do
+			local px = bx + lx
+			local gx = gx0 + px - 1
+			local matX, occX = mats[px], occs[px]
+			for ly = 1, UV do
+				local py = by + ly
+				local gy = gy0 + py - 1
+				local matXY, occXY = matX[py], occX[py]
+				local matUp, occUp = matX[py + 1], occX[py + 1]
+				for lz = 1, UV do
+					local pz = bz + lz
+					local gz = gz0 + pz - 1
+					local mat, occ = matXY[pz], occXY[pz]
+					local newId, newOcc = 0, 0
+					if occ >= MIN_OCC and mat ~= MAT_AIR and mat ~= MAT_WATER then
+						newId = getMatId(mat)
+						newOcc = floor(occ * 255 + 0.5)
+					end
+					local oldId, oldOcc = storeGet(gx, gy, gz)
+					if newId ~= 0 then
+						if oldId ~= 0 then
+							newId = oldId -- keep the material it already had (dug floors stay dirt, no grass/dirt flicker)
+						else
+							local upMat, upOcc = matUp[pz], occUp[pz]
+							if IS_CAP_BASE[newId] and (upMat == MAT_GRASS or upMat == MAT_LEAFY) and upOcc > 0 and upOcc < MIN_OCC then
+								newId = getMatId(upMat)
+							end
+							if IS_GRASS[newId] then
+								local upSolid
+								if upOcc >= MIN_OCC and upMat ~= MAT_AIR and upMat ~= MAT_WATER then
+									upSolid = true
+								elseif ly < UV or aboveReturned then
+									upSolid = false
+								else
+									upSolid = storeGet(gx, gy + 1, gz) ~= 0
+								end
+								if upSolid then
+									newId = ID_GROUND
+								end
+							end
+						end
+					end
+					if newId ~= oldId or newOcc ~= oldOcc then
+						storeSet(gx, gy, gz, newId, newOcc)
+						markVoxelChanged(gx, gy, gz)
+					end
+				end
+			end
+		end
+		pushRecentFresh(ux, uy, uz)
+	end
+
+	-- 3) Remove the returned smooth terrain again (runs of blocks along Z share one call)
+	local i = 1
+	while i <= #freshList do
+		local c = freshList[i]
+		local j = i
+		local water = c[4]
+		while j < #freshList do
+			local d = freshList[j + 1]
+			if d[1] == c[1] and d[2] == c[2] and d[3] == freshList[j][3] + 1 then
+				j = j + 1
+				water = water or d[4]
+			else
+				break
+			end
+		end
+		clearLand(c[1] * UV, c[2] * UV, c[3] * UV, UV, UV, UV * (j - i + 1), water, mats, occs,
+			(c[1] - ux0) * UV + 1, (c[2] - uy0) * UV + 1, (c[3] - uz0) * UV + 1)
+		i = j + 1
+	end
+
+	-- 4) Follow the edit into neighbouring blocks and wake buried chunks it reaches
+	--    (lots of returned blocks = terrain streaming in, so follow it a whole chunk at a time)
+	local bulk = #freshList >= 12
+	local now = os.clock()
+	for k = 1, #freshList do
+		local c = freshList[k]
+		for d = 1, 6 do
+			local dir = NEIGHBOR_DIRS[d]
+			local nux, nuy, nuz = c[1] + dir[1], c[2] + dir[2], c[3] + dir[3]
+			local ncx, ncy, ncz = floor(nux / CELLS_PER_CHUNK), floor(nuy / CELLS_PER_CHUNK), floor(nuz / CELLS_PER_CHUNK)
+			local nKey = chunkKey(ncx, ncy, ncz)
+			if CHUNK_DEFERRED[nKey] then
+				queueConvert(ncx, ncy, ncz)
+			elseif CHUNK_LIVE[nKey] and (nux < ux0 or nux > ux1 or nuy < uy0 or nuy > uy1 or nuz < uz0 or nuz > uz1) then
+				local floodKey = bulk and -nKey or cellKey(nux, nuy, nuz)
+				if (FLOOD_COOLDOWN[floodKey] or 0) <= now then
+					FLOOD_COOLDOWN[floodKey] = now + 0.1
+					if bulk then
+						local u = CELLS_PER_CHUNK
+						queueSync(ncx * u, ncy * u, ncz * u, ncx * u + u - 1, ncy * u + u - 1, ncz * u + u - 1, true)
+					else
+						queueSync(nux, nuy, nuz, nux, nuy, nuz, true)
+					end
+				end
+			end
+		end
+	end
+
+	-- 5) Explosions: blocks inside the crater that came back empty were blown away
+	local ex = job.explosion
+	if ex then
+		clearBlastInterior(ux0, uy0, uz0, ux1, uy1, uz1, ex.pos, ex.radius)
+	end
+end
+
+local function popJob(queue)
+	while #queue > 0 do
+		local job = table.remove(queue, 1)
+		if SYNC_PENDING[job.key] == job then
+			SYNC_PENDING[job.key] = nil
+			return job
+		end
+	end
+	return nil
+end
+
+-- Applies queued edits until the deadline: buried chunks being dug into, returned blocks, then section rebuilds
+local function processEdits(deadline)
+	repeat
+		local c = table.remove(CONVERT_URGENT, 1)
+		if c then
+			CONVERT_PENDING[chunkKey(c[1], c[2], c[3])] = nil
+			convertChunk(c[1], c[2], c[3], true)
+		else
+			local job = popJob(SYNC_URGENT)
+			if job then
+				syncCells(job)
+			else
+				local key, s = next(DIRTY_SECTIONS)
+				if key then
+					DIRTY_SECTIONS[key] = nil
+					rebuildSection(s[1], s[2], s[3])
+				else
+					job = popJob(SYNC_NORMAL)
+					if job then
+						syncCells(job)
+					else
+						return
+					end
+				end
+			end
+		end
+	until os.clock() >= deadline
+end
+
+local terrainRayParams = RaycastParams.new()
+terrainRayParams.FilterType = Enum.RaycastFilterType.Include
+terrainRayParams.FilterDescendantsInstances = { Terrain }
+terrainRayParams.IgnoreWater = true
+
+local visibleRayParams = RaycastParams.new() -- Terrain plus our parts (set up once CONTAINER exists)
+visibleRayParams.FilterType = Enum.RaycastFilterType.Include
+visibleRayParams.IgnoreWater = true
+
+local partRayParams = RaycastParams.new() -- only our parts (set up once CONTAINER exists)
+partRayParams.FilterType = Enum.RaycastFilterType.Include
+
+local PROBE_COOLDOWN = {}  -- [cellKey] = time before which that block isn't probed again
+local DEFER_CHECKED = {}   -- [chunkKey] = last time a buried chunk was checked for being visible
+
+-- Our parts are invisible to this ray, so any land it hits in a converted chunk is a block the server just returned
+local function probeRay(origin, dir, now)
+	local hit = Workspace:Raycast(origin, dir, terrainRayParams)
+	if not hit or hit.Instance ~= Terrain then
+		return
+	end
+	local p = hit.Position - hit.Normal * 0.5
+	local gx, gy, gz = floor(p.X / VS), floor(p.Y / VS), floor(p.Z / VS)
+	local cx, cy, cz = floor(gx / CV), floor(gy / CV), floor(gz / CV)
+	local cKey = chunkKey(cx, cy, cz)
+	if CHUNK_LIVE[cKey] then
+		local ux, uy, uz = floor(gx / UV), floor(gy / UV), floor(gz / UV)
+		local ck = cellKey(ux, uy, uz)
+		if (PROBE_COOLDOWN[ck] or 0) <= now then
+			PROBE_COOLDOWN[ck] = now + 0.25
+			queueSync(ux - 1, uy - 1, uz - 1, ux + 1, uy + 1, uz + 1, true)
+		end
+	elseif CHUNK_DEFERRED[cKey] and now - (DEFER_CHECKED[cKey] or -1) > 0.5 then
+		-- Buried chunks are smooth terrain on purpose; only convert one once nothing of ours hides it
+		DEFER_CHECKED[cKey] = now
+		local first = Workspace:Raycast(origin, dir, visibleRayParams)
+		if first and first.Instance == Terrain then
+			queueConvert(cx, cy, cz)
+		end
+	end
+end
+
+local function runProbes(now)
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		return
+	end
+	local vp = cam.ViewportSize
+	local dist = CONFIG.PROBE_DISTANCE
+	local nx, ny = CONFIG.PROBE_RAYS_X, CONFIG.PROBE_RAYS_Y
+	for i = 0, nx - 1 do
+		for j = 0, ny - 1 do
+			local ray = cam:ViewportPointToRay((i + math.random()) / nx * vp.X, (j + math.random()) / ny * vp.Y)
+			probeRay(ray.Origin, ray.Direction * dist, now)
+		end
+	end
+	local centerRay = cam:ViewportPointToRay(vp.X * 0.5, vp.Y * 0.5)
+	probeRay(centerRay.Origin, centerRay.Direction * dist, now)
+end
+
+-- While you fire / click, keep checking the 2013 terrain you're aiming at
+local pressCount = 0
+local aimActiveUntil = 0
+local nextAimCheck = 0
+
+local function aimStep(now)
+	if (pressCount <= 0 and now > aimActiveUntil) or now < nextAimCheck then
+		return
+	end
+	nextAimCheck = now + 0.1
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		return
+	end
+	local vp = cam.ViewportSize
+	local rays = { cam:ViewportPointToRay(vp.X * 0.5, vp.Y * 0.5) }
+	if UserInputService.MouseEnabled then
+		local m = UserInputService:GetMouseLocation()
+		rays[2] = cam:ViewportPointToRay(m.X, m.Y)
+	end
+	for _, ray in ipairs(rays) do
+		local hit = Workspace:Raycast(ray.Origin, ray.Direction * 1000, partRayParams)
+		if hit then
+			queueSyncAround(hit.Position - hit.Normal * 0.5, true)
+		end
+	end
+end
+
+local function queueExplosionSync(pos, radius)
+	local reach = math.min(radius + VS, 64)
+	local cellStuds = UV * VS
+	queueSync(
+		floor((pos.X - reach) / cellStuds), floor((pos.Y - reach) / cellStuds), floor((pos.Z - reach) / cellStuds),
+		floor((pos.X + reach) / cellStuds), floor((pos.Y + reach) / cellStuds), floor((pos.Z + reach) / cellStuds),
+		true, { pos = pos, radius = radius }
+	)
+	-- Wake buried chunks the crater reaches into
+	for cx = floor((pos.X - reach) / CHUNK_STUDS), floor((pos.X + reach) / CHUNK_STUDS) do
+		for cy = floor((pos.Y - reach) / CHUNK_STUDS), floor((pos.Y + reach) / CHUNK_STUDS) do
+			for cz = floor((pos.Z - reach) / CHUNK_STUDS), floor((pos.Z + reach) / CHUNK_STUDS) do
+				local dx = math.max(cx * CHUNK_STUDS - pos.X, 0, pos.X - (cx + 1) * CHUNK_STUDS)
+				local dy = math.max(cy * CHUNK_STUDS - pos.Y, 0, pos.Y - (cy + 1) * CHUNK_STUDS)
+				local dz = math.max(cz * CHUNK_STUDS - pos.Z, 0, pos.Z - (cz + 1) * CHUNK_STUDS)
+				if dx * dx + dy * dy + dz * dz <= reach * reach then
+					queueConvert(cx, cy, cz)
+				end
+			end
+		end
+	end
+end
+
+local function connectEditHooks()
+	local connections = {}
+
+	connections[#connections + 1] = Workspace.DescendantAdded:Connect(function(obj)
+		if obj.ClassName ~= "Explosion" then
+			return
+		end
+		-- The crater replicates a moment later, so look a few times
+		for _, delay in ipairs({ 0.1, 0.35, 0.8 }) do
+			task.delay(delay, function()
+				local ok, pos, radius, pressure, kind = pcall(function()
+					return obj.Position, obj.BlastRadius, obj.BlastPressure, obj.ExplosionType
+				end)
+				-- Roblox only craters terrain with BlastPressure > 0 and an ExplosionType other than NoCraters
+				if ok and radius > 0 and pressure > 0 and kind ~= Enum.ExplosionType.NoCraters then
+					queueExplosionSync(pos, radius)
+				end
+			end)
+		end
 	end)
+
+	local function isPress(input)
+		return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+	end
+	connections[#connections + 1] = UserInputService.InputBegan:Connect(function(input)
+		if isPress(input) then
+			pressCount = pressCount + 1
+			nextAimCheck = os.clock() + 0.05
+		end
+	end)
+	connections[#connections + 1] = UserInputService.InputEnded:Connect(function(input)
+		if isPress(input) then
+			pressCount = math.max(0, pressCount - 1)
+			aimActiveUntil = os.clock() + 1
+		end
+	end)
+
+	return connections
+end
+
+------------------------------------------------------------------------------------------------
+-- Scheduler: edits first, then nearest-first loading, all inside a per-frame budget
+------------------------------------------------------------------------------------------------
+
+local function buildLoadQueue(center)
+	local list = {}
+	local ccx, ccz = floor(center.X / CHUNK_STUDS), floor(center.Z / CHUNK_STUDS)
+	local r = math.ceil(CONFIG.HORIZONTAL_RADIUS / CHUNK_STUDS)
+	local rSq = CONFIG.HORIZONTAL_RADIUS * CONFIG.HORIZONTAL_RADIUS
+	local cyMin = floor((center.Y - CONFIG.VERTICAL_DOWN) / CHUNK_STUDS)
+	local cyMax = floor((center.Y + CONFIG.VERTICAL_UP) / CHUNK_STUDS) - 1
+	for cx = ccx - r, ccx + r do
+		for cz = ccz - r, ccz + r do
+			local dx = (cx + 0.5) * CHUNK_STUDS - center.X
+			local dz = (cz + 0.5) * CHUNK_STUDS - center.Z
+			local distSq = dx * dx + dz * dz
+			if distSq <= rSq then
+				for cy = cyMax, cyMin, -1 do
+					local key = chunkKey(cx, cy, cz)
+					if not CHUNK_LIVE[key] and not CHUNK_DEFERRED[key] then
+						list[#list + 1] = { cx, cy, cz, distSq }
+					end
+				end
+			end
+		end
+	end
+	-- Nearest columns first, each column top-down
+	table.sort(list, function(a, b)
+		if a[4] ~= b[4] then
+			return a[4] < b[4]
+		end
+		return a[2] > b[2]
+	end)
+	return list
+end
+
+local SCAN_LISTS = { {}, {} } -- converted chunks around you, re-checked in the background as a safety net
+local SCAN_CURSORS = { 0, 0 }
+
+local function rebuildScanLists(ccx, ccy, ccz)
+	local near, far = {}, {}
+	for dx = -2, 2 do
+		for dz = -2, 2 do
+			for dy = -2, 1 do
+				local c = { ccx + dx, ccy + dy, ccz + dz }
+				if math.abs(dx) <= 1 and math.abs(dz) <= 1 then
+					near[#near + 1] = c -- includes 2 chunks down: holes you dig below you
+				elseif dy >= -1 then
+					far[#far + 1] = c
+				end
+			end
+		end
+	end
+	SCAN_LISTS = { near, far }
+	SCAN_CURSORS = { 0, 0 }
+end
+
+local function rollingScanStep(which)
+	if #SYNC_NORMAL > 0 then
+		return
+	end
+	local list = SCAN_LISTS[which]
+	for _ = 1, #list do
+		local cur = SCAN_CURSORS[which] % #list + 1
+		SCAN_CURSORS[which] = cur
+		local c = list[cur]
+		if CHUNK_LIVE[chunkKey(c[1], c[2], c[3])] then
+			local u = CELLS_PER_CHUNK
+			queueSync(c[1] * u, c[2] * u, c[3] * u, c[1] * u + u - 1, c[2] * u + u - 1, c[3] * u + u - 1, false)
+			return
+		end
+	end
+end
+
+local function runScheduler()
+	local loadQueue, loadPos = {}, 1
+	local lastCenterKey = nil
+	local loadCredit = 0
+	local startAreaDone = false
+	local frame = 0
+	local lastCooldownPurge = os.clock()
+	local connections = CONFIG.REALTIME_SYNC and connectEditHooks() or {}
+
+	local function step()
+		local frameStart = os.clock()
+		frame = frame + 1
+
+		local center = getScanCenter()
+		local ccx, ccy, ccz = floor(center.X / CHUNK_STUDS), floor(center.Y / CHUNK_STUDS), floor(center.Z / CHUNK_STUDS)
+		local centerKey = chunkKey(ccx, ccy, ccz)
+		if centerKey ~= lastCenterKey then
+			lastCenterKey = centerKey
+			loadQueue, loadPos = buildLoadQueue(center), 1
+			rebuildScanLists(ccx, ccy, ccz)
+		end
+
+		if CONFIG.REALTIME_SYNC then
+			runProbes(frameStart)
+			aimStep(frameStart)
+			if frame % 2 == 0 then
+				rollingScanStep(1)
+			elseif frame % 4 == 1 then
+				rollingScanStep(2)
+			end
+			processEdits(frameStart + CONFIG.EDIT_BUDGET)
+			if frameStart - lastCooldownPurge > 10 then
+				lastCooldownPurge = frameStart
+				PROBE_COOLDOWN = {}
+				DEFER_CHECKED = {}
+				FLOOD_COOLDOWN = {}
+			end
+		end
+
+		-- Convert chunks nearest-first; a slow chunk borrows from the next frames' budget instead of stacking up
+		local budget = startAreaDone and CONFIG.BACKGROUND_LOAD_BUDGET or CONFIG.LOAD_BUDGET
+		loadCredit = math.min(loadCredit + budget, budget)
+		while loadCredit > 0 and loadPos <= #loadQueue do
+			local c = loadQueue[loadPos]
+			loadPos = loadPos + 1
+			local key = chunkKey(c[1], c[2], c[3])
+			if not CHUNK_LIVE[key] and not CHUNK_DEFERRED[key] then
+				local t0 = os.clock()
+				convertChunk(c[1], c[2], c[3], false)
+				loadCredit = loadCredit - (os.clock() - t0)
+			end
+		end
+		if not startAreaDone and loadPos > #loadQueue then
+			startAreaDone = true -- start area done: keep converting new chunks in the background only
+			print(string.format("[%s] Start area converted: %d parts (textures: %s)", "Voxel2013", TOTAL_PARTS,
+				HAS_CUSTOM_ASSETS and "on" or "off"))
+		end
+	end
+
+	while CONTAINER and CONTAINER.Parent do
+		local ok, err = pcall(step)
+		if not ok then
+			warn("[Voxel2013] " .. tostring(err))
+		end
+		RunService.RenderStepped:Wait()
+	end
+
+	for _, conn in ipairs(connections) do
+		conn:Disconnect()
+	end
 end
 
 local function run2013VoxelConversion()
@@ -1119,75 +1706,17 @@ local function run2013VoxelConversion()
 	container.Name = "VoxelTerrain2013"
 	container.Parent = Workspace
 	CONTAINER = container
-
-	local gui, statusLabel = createStatusBanner()
-	task.wait()
+	visibleRayParams.FilterDescendantsInstances = { Terrain, container }
+	partRayParams.FilterDescendantsInstances = { container }
 
 	init2013Textures()
 
-	local center = getScanCenter()
-	local chunkStuds = CONFIG.CHUNK_VOXELS * CONFIG.VOXEL_SIZE
-
-	local minX = snapToChunk(center.X - CONFIG.HORIZONTAL_RADIUS)
-	local maxX = snapToChunk(center.X + CONFIG.HORIZONTAL_RADIUS)
-	local minZ = snapToChunk(center.Z - CONFIG.HORIZONTAL_RADIUS)
-	local maxZ = snapToChunk(center.Z + CONFIG.HORIZONTAL_RADIUS)
-	local minY = snapToChunk(center.Y - CONFIG.VERTICAL_DOWN)
-	local maxY = snapToChunk(center.Y + CONFIG.VERTICAL_UP)
-
-	local columns = {}
-	for x = minX, maxX - chunkStuds, chunkStuds do
-		for z = minZ, maxZ - chunkStuds, chunkStuds do
-			local dx = (x + chunkStuds * 0.5) - center.X
-			local dz = (z + chunkStuds * 0.5) - center.Z
-			columns[#columns + 1] = {
-				x = x,
-				z = z,
-				distSq = dx * dx + dz * dz
-			}
-		end
-	end
-
-	table.sort(columns, function(a, b)
-		return a.distSq < b.distSq
-	end)
-
-	local totalColumns = #columns
-	local totalParts = 0
-	local lastYield = os.clock()
-
-	for idx = 1, totalColumns do
-		local col = columns[idx]
-		for y = maxY - chunkStuds, minY, -chunkStuds do
-			local cMin = Vector3.new(col.x, y, col.z)
-			local cMax = Vector3.new(col.x + chunkStuds, y + chunkStuds, col.z + chunkStuds)
-
-			local added = processChunk(cMin, cMax, container, false)
-			totalParts = totalParts + added
-
-			if os.clock() - lastYield >= CONFIG.FRAME_BUDGET then
-				if statusLabel then
-					local pct = math.floor((idx / totalColumns) * 100)
-					statusLabel.Text = string.format("2013 Voxel Terrain: %d%% (%d parts)", pct, totalParts)
-				end
-				task.wait()
-				lastYield = os.clock()
-			end
-		end
-	end
-
-	INITIAL_LOAD_DONE = true
-	startRealtimeTerrainSync()
-
-	if statusLabel then
-		statusLabel.Text = string.format("2013 Voxel Terrain Ready! (%d parts)", totalParts)
-	end
-	task.delay(3, function()
-		if gui then
-			gui:Destroy()
-		end
-	end)
+	runScheduler()
 end
 
-task.spawn(run2013VoxelConversion)
-
+task.spawn(function()
+	local ok, err = pcall(run2013VoxelConversion)
+	if not ok then
+		warn("[Voxel2013] failed to start: " .. tostring(err))
+	end
+end)
