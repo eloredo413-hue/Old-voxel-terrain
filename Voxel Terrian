@@ -20,7 +20,6 @@
 
 local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
-local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 
@@ -154,48 +153,6 @@ local function init2013Textures()
 			end
 		end
 	end
-end
-
-local function createStatusBanner()
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "Voxel2013StatusGui"
-	gui.ResetOnSpawn = false
-
-	local ok = pcall(function()
-		gui.Parent = CoreGui
-	end)
-	if not ok then
-		local lp = Players.LocalPlayer
-		if lp then
-			gui.Parent = lp:FindFirstChildOfClass("PlayerGui")
-		end
-	end
-
-	local frame = Instance.new("Frame")
-	frame.Size = UDim2.new(0, 400, 0, 42)
-	frame.Position = UDim2.new(0.5, -200, 0, 16)
-	frame.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
-	frame.BackgroundTransparency = 0.15
-	frame.BorderSizePixel = 3
-	frame.BorderColor3 = Color3.fromRGB(255, 0, 0)
-	frame.Parent = gui
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(255, 0, 0)
-	stroke.Thickness = 2.5
-	stroke.Parent = frame
-
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, -16, 1, 0)
-	label.Position = UDim2.new(0, 8, 0, 0)
-	label.BackgroundTransparency = 1
-	label.Font = Enum.Font.SourceSansBold
-	label.TextSize = 18
-	label.TextColor3 = Color3.fromRGB(255, 255, 255)
-	label.Text = "2013 Voxel Terrain: Starting..."
-	label.Parent = frame
-
-	return gui, label
 end
 
 
@@ -1647,14 +1604,12 @@ local function rollingScanStep(which)
 	end
 end
 
-local function runScheduler(gui, statusLabel)
+local function runScheduler()
 	local loadQueue, loadPos = {}, 1
 	local lastCenterKey = nil
-	local loadedCount = 0
 	local loadCredit = 0
 	local startAreaDone = false
 	local frame = 0
-	local lastLabelUpdate = 0
 	local lastCooldownPurge = os.clock()
 	local connections = CONFIG.REALTIME_SYNC and connectEditHooks() or {}
 
@@ -1699,27 +1654,10 @@ local function runScheduler(gui, statusLabel)
 				local t0 = os.clock()
 				convertChunk(c[1], c[2], c[3], false)
 				loadCredit = loadCredit - (os.clock() - t0)
-				loadedCount = loadedCount + 1
 			end
 		end
-
-		if not startAreaDone then
-			if loadPos > #loadQueue then
-				startAreaDone = true
-				if statusLabel then
-					statusLabel.Text = string.format("2013 Voxel Terrain Ready! (%d parts)", TOTAL_PARTS)
-				end
-				task.delay(3, function()
-					if gui then
-						gui:Destroy()
-					end
-				end)
-			elseif statusLabel and frameStart - lastLabelUpdate > 0.1 then
-				lastLabelUpdate = frameStart
-				local remaining = #loadQueue - loadPos + 1
-				local pct = math.floor(loadedCount / math.max(1, loadedCount + remaining) * 100)
-				statusLabel.Text = string.format("2013 Voxel Terrain: %d%% (%d parts)", pct, TOTAL_PARTS)
-			end
+		if not startAreaDone and loadPos > #loadQueue then
+			startAreaDone = true -- start area done: keep converting new chunks in the background only
 		end
 	end
 
@@ -1749,12 +1687,9 @@ local function run2013VoxelConversion()
 	visibleRayParams.FilterDescendantsInstances = { Terrain, container }
 	partRayParams.FilterDescendantsInstances = { container }
 
-	local gui, statusLabel = createStatusBanner()
-	task.wait()
-
 	init2013Textures()
 
-	runScheduler(gui, statusLabel)
+	runScheduler()
 end
 
 task.spawn(run2013VoxelConversion)
